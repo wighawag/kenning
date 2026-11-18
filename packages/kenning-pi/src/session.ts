@@ -11,6 +11,7 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import {formatDelivery} from './format.js';
 import {acquire, release} from './shared.js';
+import {inWhereverServer, mayBeTerminalHuman, mayWakeItself} from './mode.js';
 import {
 	SPAWN_ENV,
 	WAKE_GAP_MS,
@@ -329,11 +330,15 @@ export class SessionController {
 	 * proves nothing: a headless child kenning spawned, a cron job or an agent's
 	 * bash running `pi -p "I approve"` would all count as the human (D27). Outside
 	 * the TUI it is the human only under the CLI's rule (D2): a terminal on stdin
-	 * and no agent session around it.
+	 * and no agent session around it. Inside wherever, never (D36).
 	 */
 	private typedAtTerminal(): boolean {
-		if (this.ctx?.mode === 'tui') return true;
-		return !!process.stdin.isTTY && !process.env.PI_SESSION_FILE;
+		return mayBeTerminalHuman({
+			mode: this.ctx?.mode ?? 'print',
+			inWhereverServer: inWhereverServer(),
+			stdinIsTTY: !!process.stdin.isTTY,
+			inAgentSession: !!process.env.PI_SESSION_FILE,
+		});
 	}
 
 	// ---------------------------------------------------------------- delivery
@@ -345,11 +350,15 @@ export class SessionController {
 			this.handleStops();
 			this.wakeOwned();
 			this.refreshNotices();
-			// A `pi -p` run never wakes itself: print mode prompts right after
-			// session_start, and a wake there made that prompt fail with "Agent is
-			// already processing" (measured). Its messages join the prompt at
-			// before_agent_start; later ones wait for the owner's next wake (D29).
-			if (this.ctx.mode === 'print' || this.ctx.mode === 'json') return;
+			// A real `pi -p` run never wakes itself (D29); a print-mode session in
+			// wherever's server does, or nothing would deliver to it (D36).
+			if (
+				!mayWakeItself({
+					mode: this.ctx.mode,
+					inWhereverServer: inWhereverServer(),
+				})
+			)
+				return;
 			if (this.phase !== 'settled' || !this.ctx.isIdle()) return;
 			const since = this.abortedAt ?? -Infinity;
 			const pending = this.kenning!.pendingFor(this.file!);
