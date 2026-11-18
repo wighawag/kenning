@@ -31,7 +31,7 @@
 
 - Tabs, single quotes, no bracket spacing (`.prettierrc`). Run `pnpm format` before finishing.
 - Comments explain why. If a line encodes a measured fact, say the number.
-- Every behavioural change gets a test at a seam already in use: the `Kenning` interface, `readTail`, `planDelivery`, `runCli`, the multi-process writer, or the real-pi flows in `packages/kenning-pi/test/flows.test.ts`.
+- Every behavioural change gets a test at a seam already in use: the `Kenning` interface, `readTail`, `planDelivery`, `runCli`, the multi-process writer, the real-pi flows in `packages/kenning-pi/test/flows.test.ts`, or a long-lived print-mode session built with the SDK as wherever builds one (`packages/kenning-pi/test/print-host.test.ts`).
 - Add a changeset (`pnpm changeset`, or `.changeset/<name>.md` by hand) for every change to a package.
 
 ## Never stage or commit unless asked

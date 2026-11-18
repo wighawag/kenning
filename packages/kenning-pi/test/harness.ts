@@ -8,6 +8,7 @@ const KENNING_PI = path.resolve(here, '../src/index.ts');
 const BRAIN = path.resolve(here, 'fixtures/brain.ts');
 const HOST = path.resolve(here, 'fixtures/host.ts');
 export const FAKE_HOST = path.resolve(here, 'fixtures/fake-host.ts');
+const PRINT_HOST = path.resolve(here, 'fixtures/print-host.ts');
 
 /** pi on the scripted model with only kenning and the fixtures loaded; also what spawned children run. */
 function piCommand(world: World): string[] {
@@ -99,6 +100,39 @@ export class Pi {
 		return pi;
 	}
 
+	/**
+	 * A long-lived print-mode session built with the SDK, as wherever's server
+	 * builds one (fixtures/print-host.ts): prompted once with `prompt`, never
+	 * again. `wherever` sets wherever's server-process marker in it (D36).
+	 */
+	static startPrintHost(
+		world: World,
+		name: string,
+		prompt: string,
+		opts: {wherever: boolean},
+	): Pi {
+		const cwd = path.join(world.root, name);
+		fs.mkdirSync(cwd, {recursive: true});
+		// Node runs the .ts fixture by stripping types: on by default from 22.18
+		// and 23.6, behind a flag on the older Nodes `engines` allows (>=22.5).
+		const strip = (process as {features?: {typescript?: unknown}}).features
+			?.typescript
+			? []
+			: ['--experimental-strip-types'];
+		const proc = spawn(process.execPath, [...strip, PRINT_HOST, prompt], {
+			cwd,
+			env: {
+				...testEnv(world),
+				PRINT_HOST_WHEREVER: opts.wherever ? '1' : '0',
+			},
+			detached: true,
+			stdio: ['pipe', 'pipe', 'pipe'],
+		}) as ChildProcessWithoutNullStreams;
+		const pi = new Pi(name, proc);
+		world.procs.push(pi);
+		return pi;
+	}
+
 	private onData(d: Buffer) {
 		this.buf += d.toString('utf8');
 		let i: number;
@@ -169,6 +203,34 @@ export class Pi {
 			from,
 			what: `response to ${text.slice(0, 40)}`,
 		});
+	}
+
+	/**
+	 * Wait until this pi is not running AND the test has read everything it
+	 * emitted. pi writes events and responses to stdout in order, so once a
+	 * `get_state` response is read, so is every event before it; a wake that
+	 * ran entirely between two reads (seen under load) cannot then leak its
+	 * events past the next prompt's mark.
+	 */
+	async settled(timeoutMs = 15_000): Promise<void> {
+		const end = Date.now() + timeoutMs;
+		for (;;) {
+			const from = this.mark();
+			const id = this.send({type: 'get_state'});
+			const r = await this.waitFor(
+				(e) => e.type === 'response' && e.id === id,
+				{
+					from,
+					what: 'get_state',
+				},
+			);
+			const last = this.events
+				.filter((e) => e.type === 'agent_start' || e.type === 'agent_settled')
+				.at(-1)?.type;
+			if (!r.data?.isStreaming && last !== 'agent_start') return;
+			if (Date.now() > end) throw new Error(`${this.name}: never settled`);
+			await new Promise((res) => setTimeout(res, 50));
+		}
 	}
 
 	/** Prompt and wait until the run fully settles. */

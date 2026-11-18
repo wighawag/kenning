@@ -160,7 +160,11 @@ describe('a host spawns a child the orchestrator owns', () => {
 		);
 		expect(() => k.relayFromHuman(child, {})).toThrow(/no human turn/);
 
-		// Both sides can see the relationship.
+		// Both sides can see the relationship. The child's message woke the
+		// orchestrator: wait until that run is over and the test has read all of
+		// it, or the next prompt lands on a busy session, or the wake's events
+		// (still in the pipe) land after the prompt's mark (both seen under load).
+		await orch.settled();
 		const listed = texts(await orch.prompt('DO session_list {}')).join('\n');
 		expect(listed).toContain('owns 1:');
 		expect(listed).toContain('owner: orchestrator:t');
