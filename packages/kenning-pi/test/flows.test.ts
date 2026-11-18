@@ -1,10 +1,12 @@
 import {openKenning, type Kenning} from 'kenning';
 import {afterAll, beforeAll, describe, expect, it} from 'vitest';
+import {HUMAN_MARK_TTL_MS} from '../src/session.js';
 import {
 	anyAlive,
 	endWorld,
 	newWorld,
 	Pi,
+	survivors,
 	texts,
 	type World,
 } from './harness.js';
@@ -49,8 +51,10 @@ afterAll(async () => {
 	);
 	expect(errors).toEqual([]);
 	const procs = w.procs;
-	await endWorld(w);
+	const leaked = await endWorld(w);
+	expect(leaked).toEqual([]);
 	expect(anyAlive(procs)).toEqual([]);
+	expect(survivors(w)).toEqual([]);
 });
 
 describe('lanes that know about each other', () => {
@@ -169,6 +173,44 @@ describe('provenance', () => {
 		expect(seen).toContain('origin: human-relayed');
 		expect(seen).toContain("the human's own words, typed on test-host");
 		expect(seen).toContain('2. I approve the MIT license for missiv-identity');
+	}, 30_000);
+
+	it('a human-input mark expires: an unmarked send of the same text later is not the human', async () => {
+		const file = fileOf(push);
+		// The host marked a send that never reached kenning's input handler.
+		await push.command('/test-human-mark run the standup');
+		await quiet(HUMAN_MARK_TTL_MS + 300);
+		// Later, a scheduled job sends the identical text, unmarked.
+		await push.prompt('/test-extension-says run the standup');
+		expect(() => k.relayFromHuman(file, {quote: 'run the standup'})).toThrow(
+			/no human turn/,
+		);
+		// A mark followed at once by its send is still the human's.
+		await push.prompt('/test-human-says run the retro now');
+		expect(k.relayFromHuman(file, {quote: 'run the retro now'})).toMatchObject({
+			text: 'run the retro now',
+			channel: 'test-host',
+		});
+	}, 30_000);
+
+	it('a host that awaits its send closes the mark: no window for a later identical send', async () => {
+		const file = fileOf(push);
+		await push.command('/test-human-mark-ended deploy to staging');
+		// At once, not after 5 s: the closed mark can no longer match.
+		await push.prompt('/test-extension-says deploy to staging');
+		expect(() => k.relayFromHuman(file, {quote: 'deploy to staging'})).toThrow(
+			/no human turn/,
+		);
+		// A send that went through is the human's; its end after the run is a no-op.
+		await push.prompt('/test-human-says-awaited ship the docs');
+		expect(k.relayFromHuman(file, {quote: 'ship the docs'})).toMatchObject({
+			channel: 'awaited-host',
+		});
+		// An end names one mark: the other one with the same text still matches.
+		await push.prompt('/test-two-marks merge it');
+		expect(k.relayFromHuman(file, {quote: 'merge it'})).toMatchObject({
+			channel: 'second',
+		});
 	}, 30_000);
 
 	it("an agent cannot pass its own words, or a plain RPC prompt, off as the human's", async () => {

@@ -1,9 +1,14 @@
+import fs from 'node:fs';
 import {defaultStateDir, openDb, write, type DB} from './store.js';
 import {OsProbe, type ProcessIdentity, type ProcessProbe} from './liveness.js';
 import {
 	KenningError,
+	type ArchiveMark,
 	type AttentionItem,
 	type Message,
+	type Ownership,
+	type SpawnVia,
+	type StopRequest,
 	type Origin,
 	type Presence,
 	type Question,
@@ -64,6 +69,76 @@ type PresenceRow = {
 const DAY = 86_400_000;
 
 export const MAX_TEXT_BYTES = 8 * 1024;
+
+/**
+ * D24: an archive or delete cascade can be undone, as one batch, for 7 days. A
+ * cascade from an orchestrator takes every lane with it, and an accidental one
+ * is often noticed only after a weekend; until the window ends a host must not
+ * remove a deleted session's transcript. Rejected: a seconds-long "undo" toast
+ * (a cascade is noticed later than that) and 24 hours (shorter than a weekend).
+ */
+export const ARCHIVE_UNDO_MS = 7 * DAY;
+
+export interface SpawnInput {
+	owner: string;
+	folder: string;
+	/** The first prompt: delivered once, as a `spawn` message from the owner (D28). */
+	prompt?: string | null;
+	role?: string | null;
+	via: SpawnVia;
+	detail?: Record<string, unknown>;
+}
+
+type OwnershipRow = {
+	id: string;
+	session_file: string | null;
+	owner: string;
+	folder: string;
+	role: string | null;
+	via: SpawnVia;
+	detail: string | null;
+	prompt: string | null;
+	created_at: number;
+	bound_at: number | null;
+	wake_until: number | null;
+};
+
+type ArchiveRow = {
+	session_file: string;
+	kind: ArchiveMark['kind'];
+	batch: string;
+	by_label: string;
+	at: number;
+};
+
+type StopRow = {
+	id: string;
+	session_file: string;
+	by_session: string | null;
+	by_label: string;
+	at: number;
+	handled_at: number | null;
+	outcome: StopRequest['outcome'];
+};
+
+const toArchive = (r: ArchiveRow): ArchiveMark => ({
+	session: r.session_file,
+	kind: r.kind,
+	batch: r.batch,
+	by: r.by_label,
+	at: r.at,
+	undoUntil: r.at + ARCHIVE_UNDO_MS,
+});
+
+const toStop = (r: StopRow): StopRequest => ({
+	id: r.id,
+	session: r.session_file,
+	by: r.by_session,
+	byLabel: r.by_label,
+	at: r.at,
+	handledAt: r.handled_at,
+	outcome: r.outcome,
+});
 
 export interface SendInput {
 	/** The sending session, or null for a human at the CLI. */
@@ -1027,6 +1102,397 @@ export class Kenning {
 		};
 	}
 
+	// --------------------------------------------------------------- ownership
+
+	/**
+	 * Start a spawn: the ownership record exists before the new session does, so
+	 * a terminal child can bind itself at its own `session_start` (D28). The owner
+	 * is fixed here and never changes.
+	 */
+	beginSpawn(input: SpawnInput): Ownership {
+		if (input.prompt && Buffer.byteLength(input.prompt) > MAX_TEXT_BYTES)
+			throw new KenningError(
+				`the first prompt is over 8 KB (${Buffer.byteLength(input.prompt)} bytes): put the plan in git and point at it`,
+				'too-large',
+			);
+		if (input.role && !ROLE_RE.test(input.role))
+			throw new KenningError(
+				`invalid role ${JSON.stringify(input.role)}`,
+				'bad-role',
+			);
+		const id = newId('sp');
+		this.tx(() => {
+			this.db
+				.prepare(
+					`INSERT INTO ownership(id, owner, folder, role, via, detail, prompt, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.run(
+					id,
+					input.owner,
+					input.folder,
+					input.role ?? null,
+					input.via,
+					input.detail ? JSON.stringify(input.detail) : null,
+					input.prompt ?? null,
+					this.now(),
+				);
+		});
+		return this.spawnRecord(id)!;
+	}
+
+	/**
+	 * The spawned session exists: bind it to its spawn, once, and queue its first
+	 * prompt as a `spawn` message from the owner, origin agent (never a human
+	 * turn, D28). Binding the same session again is a no-op; a session that is
+	 * already owned, or a spawn bound to another session, is refused: ownership
+	 * never changes.
+	 */
+	bindSpawn(spawnId: string, sessionFile: string): Ownership {
+		this.tx(() => {
+			const row = this.db
+				.prepare(`SELECT * FROM ownership WHERE id = ?`)
+				.get(spawnId) as OwnershipRow | undefined;
+			if (!row) throw new KenningError(`no spawn ${spawnId}`, 'not-found');
+			if (row.session_file === sessionFile) return;
+			if (row.session_file)
+				throw new KenningError(
+					`spawn ${spawnId} is already ${row.session_file}`,
+					'owned',
+				);
+			const other = this.db
+				.prepare(`SELECT owner FROM ownership WHERE session_file = ?`)
+				.get(sessionFile) as {owner: string} | undefined;
+			if (other)
+				throw new KenningError(
+					`${sessionFile} is already owned by ${other.owner}; ownership never changes`,
+					'owned',
+				);
+			if (
+				sessionFile === row.owner ||
+				this.ancestors(row.owner).includes(sessionFile)
+			)
+				throw new KenningError(
+					`${sessionFile} cannot be owned by ${row.owner}: that would be a cycle`,
+					'cycle',
+				);
+			this.db
+				.prepare(
+					`UPDATE ownership SET session_file = ?, bound_at = ? WHERE id = ?`,
+				)
+				.run(sessionFile, this.now(), spawnId);
+			if (row.prompt)
+				this.insertMessage({
+					from: row.owner,
+					fromLabel: this.labelOf(row.owner),
+					to: {kind: 'session', target: sessionFile},
+					kind: 'spawn',
+					text: row.prompt,
+					origin: 'agent',
+					requestId: `spawn:${spawnId}`,
+				});
+		});
+		return this.spawnRecord(spawnId)!;
+	}
+
+	/** Record that `owner` owns an existing session (a host that spawned it by its own means). */
+	recordOwnership(input: SpawnInput & {session: string}): Ownership {
+		const sp = this.beginSpawn(input);
+		try {
+			return this.bindSpawn(sp.id, input.session);
+		} catch (e) {
+			this.tx(() => {
+				this.db.prepare(`DELETE FROM ownership WHERE id = ?`).run(sp.id);
+			});
+			throw e;
+		}
+	}
+
+	spawnRecord(spawnId: string): Ownership | null {
+		const row = this.db
+			.prepare(`SELECT * FROM ownership WHERE id = ?`)
+			.get(spawnId) as OwnershipRow | undefined;
+		return row ? this.toOwnership(row) : null;
+	}
+
+	/** The ownership record of a session, or null when nobody spawned it. */
+	ownership(sessionFile: string): Ownership | null {
+		const row = this.db
+			.prepare(`SELECT * FROM ownership WHERE session_file = ?`)
+			.get(sessionFile) as OwnershipRow | undefined;
+		return row ? this.toOwnership(row) : null;
+	}
+
+	ownerOf(sessionFile: string): string | null {
+		return this.ownership(sessionFile)?.owner ?? null;
+	}
+
+	/**
+	 * The sessions `owner` spawned, live or not, oldest first; with `transitive`,
+	 * their own children too (depth first). Spawns that never came up are left out.
+	 */
+	ownedBy(owner: string, opts: {transitive?: boolean} = {}): Ownership[] {
+		const out: Ownership[] = [];
+		const seen = new Set([owner]);
+		const walk = (o: string) => {
+			const rows = this.db
+				.prepare(
+					`SELECT * FROM ownership WHERE owner = ? AND session_file IS NOT NULL ORDER BY created_at, rowid`,
+				)
+				.all(o) as OwnershipRow[];
+			for (const r of rows) {
+				if (seen.has(r.session_file!)) continue;
+				seen.add(r.session_file!);
+				out.push(this.toOwnership(r));
+				if (opts.transitive) walk(r.session_file!);
+			}
+		};
+		walk(owner);
+		return out;
+	}
+
+	/**
+	 * Whether `caller` owns `target`, directly or through the sessions it owns
+	 * (D23): an orchestrator answers for its children's children too.
+	 */
+	owns(caller: string, target: string): boolean {
+		return this.ancestors(target).includes(caller);
+	}
+
+	/** The owner, the owner's owner, and so on up. */
+	private ancestors(sessionFile: string): string[] {
+		const out: string[] = [];
+		for (let s = this.ownerOf(sessionFile); s && out.length < 64;) {
+			if (out.includes(s)) break;
+			out.push(s);
+			s = this.ownerOf(s);
+		}
+		return out;
+	}
+
+	/**
+	 * A host archives or deletes a session: mark it and every session it owns,
+	 * transitively, as one batch (D24). kenning cannot touch transcripts; the host
+	 * hides or deletes them, and must keep a deleted one until `undoUntil`.
+	 * Sessions already archived keep their own batch.
+	 */
+	archive(
+		sessionFile: string,
+		opts: {kind: ArchiveMark['kind']; by: string},
+	): {batch: string; at: number; undoUntil: number; sessions: string[]} {
+		const batch = newId('ar');
+		const at = this.now();
+		const sessions = this.tx(() => {
+			// Inside the transaction, so a child bound meanwhile is not missed.
+			const all = [
+				sessionFile,
+				...this.ownedBy(sessionFile, {transitive: true}).map((o) => o.session!),
+			];
+			const marked: string[] = [];
+			for (const s of all) {
+				const r = this.db
+					.prepare(
+						`INSERT INTO archive(session_file, kind, batch, by_label, at) VALUES(?, ?, ?, ?, ?) ON CONFLICT(session_file) DO NOTHING`,
+					)
+					.run(s, opts.kind, batch, opts.by, at);
+				if (r.changes) marked.push(s);
+			}
+			return marked;
+		});
+		return {batch, at, undoUntil: at + ARCHIVE_UNDO_MS, sessions};
+	}
+
+	/** Undo a whole archive batch within its window; returns the sessions restored. */
+	undoArchive(batch: string): string[] {
+		return this.tx(() => {
+			const rows = this.db
+				.prepare(`SELECT * FROM archive WHERE batch = ?`)
+				.all(batch) as ArchiveRow[];
+			if (!rows.length)
+				throw new KenningError(`no archive batch ${batch}`, 'not-found');
+			if (rows[0].at + ARCHIVE_UNDO_MS < this.now())
+				throw new KenningError(
+					`archive ${batch} is past its undo window (7 days)`,
+					'expired',
+				);
+			this.db.prepare(`DELETE FROM archive WHERE batch = ?`).run(batch);
+			return rows.map((r) => r.session_file);
+		});
+	}
+
+	archiveMark(sessionFile: string): ArchiveMark | null {
+		const row = this.db
+			.prepare(`SELECT * FROM archive WHERE session_file = ?`)
+			.get(sessionFile) as ArchiveRow | undefined;
+		return row ? toArchive(row) : null;
+	}
+
+	/** Marks whose undo window has passed: a host may now make them permanent. */
+	expiredArchives(): ArchiveMark[] {
+		return (
+			this.db
+				.prepare(`SELECT * FROM archive WHERE at < ? ORDER BY at`)
+				.all(this.now() - ARCHIVE_UNDO_MS) as ArchiveRow[]
+		).map(toArchive);
+	}
+
+	/**
+	 * D29: the headless children of `owner` that have messages to read which
+	 * arrived after their last stop, and are not archived. One cached query,
+	 * since every session's poller asks on every change. Measured: 3 µs for a
+	 * session that owns nothing, 42 µs with 5 children and one to wake, against
+	 * about 500 µs as separate reads per child. Liveness is left to the caller:
+	 * it is a process probe, not SQL.
+	 */
+	wakeCandidates(owner: string): Ownership[] {
+		const rows = this.cached(
+			`SELECT o.* FROM ownership o
+			 LEFT JOIN (SELECT session_file, max(at) AS at FROM stop_request GROUP BY session_file) s
+			   ON s.session_file = o.session_file
+			 WHERE o.owner = ? AND o.via = 'headless' AND o.session_file IS NOT NULL
+			   AND NOT EXISTS (SELECT 1 FROM archive a WHERE a.session_file = o.session_file)
+			   AND (EXISTS (SELECT 1 FROM message m WHERE m.state = 'pending' AND m.to_kind = 'session'
+			                  AND m.to_target = o.session_file AND m.created_at > COALESCE(s.at, -1))
+			     OR EXISTS (SELECT 1 FROM role r JOIN message m ON m.state = 'pending' AND m.to_kind = 'role'
+			                  AND m.to_target = r.role
+			                WHERE r.session_file = o.session_file AND m.created_at > COALESCE(s.at, -1)))
+			 ORDER BY o.created_at`,
+		).all(owner) as OwnershipRow[];
+		return rows.map((r) => this.toOwnership(r));
+	}
+
+	/**
+	 * Prepared once per connection, for the queries the poller runs on every
+	 * change: compiling a statement is most of the cost of a small query.
+	 */
+	private statements = new Map<string, ReturnType<DB['prepare']>>();
+	private cached(sql: string): ReturnType<DB['prepare']> {
+		let st = this.statements.get(sql);
+		if (!st) this.statements.set(sql, (st = this.db.prepare(sql)));
+		return st;
+	}
+
+	/**
+	 * A headless child is being woken (D29): granted to exactly one caller until
+	 * the lease lapses, so two polls or two processes never start it twice. A
+	 * refusal says when the current lease ends, so the caller can look again then.
+	 */
+	leaseWake(
+		sessionFile: string,
+		ms: number,
+	): {ok: true} | {ok: false; until: number | null} {
+		// Read first: a refused lease must not write. A write bumps changeToken(),
+		// which wakes every poller, which asks again: a write-lock loop every
+		// poll while the lease is held (invariant 4's reason; found in review).
+		const held = this.db
+			.prepare(`SELECT wake_until FROM ownership WHERE session_file = ?`)
+			.get(sessionFile) as {wake_until: number | null} | undefined;
+		if (!held) return {ok: false, until: null};
+		if (held.wake_until != null && held.wake_until >= this.now())
+			return {ok: false, until: held.wake_until};
+		return this.tx(() => {
+			const t = this.now();
+			const r = this.db
+				.prepare(
+					`UPDATE ownership SET wake_until = ? WHERE session_file = ? AND (wake_until IS NULL OR wake_until < ?)`,
+				)
+				.run(t + ms, sessionFile, t);
+			if (r.changes === 1) return {ok: true as const};
+			const row = this.db
+				.prepare(`SELECT wake_until FROM ownership WHERE session_file = ?`)
+				.get(sessionFile) as {wake_until: number | null} | undefined;
+			return {ok: false as const, until: row?.wake_until ?? null};
+		});
+	}
+
+	/**
+	 * The woken child is up: shorten its lease to `gapMs` from now. Once it has
+	 * exited, the next wake may come after that gap, not before: a child that
+	 * dies before reading its messages is retried at that pace, never in a loop.
+	 */
+	wakeDone(sessionFile: string, gapMs: number): void {
+		const until = this.now() + gapMs;
+		const row = this.db
+			.prepare(`SELECT wake_until FROM ownership WHERE session_file = ?`)
+			.get(sessionFile) as {wake_until: number | null} | undefined;
+		// No write lock for nothing (the reason behind invariant 4).
+		if (row?.wake_until == null || row.wake_until <= until) return;
+		this.tx(() => {
+			this.db
+				.prepare(
+					`UPDATE ownership SET wake_until = ? WHERE session_file = ? AND wake_until > ?`,
+				)
+				.run(until, sessionFile, until);
+		});
+	}
+
+	protected toOwnership(r: OwnershipRow): Ownership {
+		return {
+			id: r.id,
+			session: r.session_file,
+			owner: r.owner,
+			folder: r.folder,
+			role: r.role,
+			via: r.via,
+			detail: r.detail ? (JSON.parse(r.detail) as Record<string, unknown>) : {},
+			createdAt: r.created_at,
+			boundAt: r.bound_at,
+			archived: r.session_file ? this.archiveMark(r.session_file) : null,
+		};
+	}
+
+	// -------------------------------------------------------------------- stop
+
+	/**
+	 * Ask a session to stop its current turn (D30). Its own extension acts on it
+	 * at the next poll and records the outcome; it never cascades. Authorisation
+	 * is the caller's job: the tool checks `owns`, the CLI that a human runs it.
+	 */
+	requestStop(sessionFile: string, opts: {by: string | null}): StopRequest {
+		const id = newId('s');
+		this.tx(() => {
+			this.db
+				.prepare(
+					`INSERT INTO stop_request(id, session_file, by_session, by_label, at) VALUES(?, ?, ?, ?, ?)`,
+				)
+				.run(id, sessionFile, opts.by, this.labelOf(opts.by), this.now());
+		});
+		return this.stopRequest(id)!;
+	}
+
+	stopRequest(id: string): StopRequest | null {
+		const row = this.db
+			.prepare(`SELECT * FROM stop_request WHERE id = ?`)
+			.get(id) as StopRow | undefined;
+		return row ? toStop(row) : null;
+	}
+
+	/** Stop requests this session has not acted on yet, oldest first. A read: no lock. */
+	openStops(sessionFile: string): StopRequest[] {
+		return (
+			this.cached(
+				`SELECT * FROM stop_request WHERE session_file = ? AND handled_at IS NULL ORDER BY at, rowid`,
+			).all(sessionFile) as StopRow[]
+		).map(toStop);
+	}
+
+	settleStop(id: string, outcome: 'stopped' | 'not-running'): void {
+		this.tx(() => {
+			this.db
+				.prepare(
+					`UPDATE stop_request SET handled_at = ?, outcome = ? WHERE id = ? AND handled_at IS NULL`,
+				)
+				.run(this.now(), outcome, id);
+		});
+	}
+
+	/** When this session was last asked to stop, or null. */
+	lastStopAt(sessionFile: string): number | null {
+		const row = this.db
+			.prepare(`SELECT max(at) AS at FROM stop_request WHERE session_file = ?`)
+			.get(sessionFile) as {at: number | null};
+		return row.at;
+	}
+
 	// --------------------------------------------------------------- retention
 
 	/**
@@ -1055,6 +1521,12 @@ export class Kenning {
 				.prepare(`DELETE FROM item WHERE state != 'open' AND finished_at < ?`)
 				.run(finished);
 			this.db.prepare(`DELETE FROM human_turn WHERE at < ?`).run(finished);
+			this.db
+				.prepare(
+					`DELETE FROM stop_request WHERE handled_at IS NOT NULL AND handled_at < ?`,
+				)
+				.run(finished);
+			this.pruneOwnership(t);
 			for (const row of dead)
 				if (!this.probe.isAlive(this.identityOf(row)))
 					this.db
@@ -1066,6 +1538,40 @@ export class Kenning {
 				)
 				.run(String(t));
 		});
+	}
+
+	/**
+	 * D25: ownership is never pruned while its session exists. A spawn that never
+	 * came up goes after a day. A bound record goes only when its transcript file
+	 * is gone, nobody runs it, and it is over 30 days old (pi writes a transcript
+	 * only after the first assistant message, so a missing file alone proves
+	 * nothing about a fresh session). An archive mark goes with its transcript,
+	 * once the undo window has passed. Called inside prune's transaction.
+	 */
+	private pruneOwnership(t: number): void {
+		this.db
+			.prepare(
+				`DELETE FROM ownership WHERE session_file IS NULL AND created_at < ?`,
+			)
+			.run(t - DAY);
+		const old = this.db
+			.prepare(
+				`SELECT session_file FROM ownership WHERE session_file IS NOT NULL AND bound_at < ?`,
+			)
+			.all(t - 30 * DAY) as {session_file: string}[];
+		for (const {session_file} of old)
+			if (!fs.existsSync(session_file) && !this.isLive(session_file))
+				this.db
+					.prepare(`DELETE FROM ownership WHERE session_file = ?`)
+					.run(session_file);
+		const marks = this.db
+			.prepare(`SELECT session_file FROM archive WHERE at < ?`)
+			.all(t - Math.max(ARCHIVE_UNDO_MS, 30 * DAY)) as {session_file: string}[];
+		for (const {session_file} of marks)
+			if (!fs.existsSync(session_file))
+				this.db
+					.prepare(`DELETE FROM archive WHERE session_file = ?`)
+					.run(session_file);
 	}
 
 	/** Prune when the last prune is a day old. Cheap enough to call on every open. */

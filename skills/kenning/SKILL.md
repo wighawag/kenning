@@ -22,7 +22,13 @@ Every message says where it comes from: `human`, `agent`, or `human-relayed`. On
 
 ## Orchestrating
 
-An orchestrator answers what the plan or the git state settles, and merges the rest into one `human_ask` with `onBehalfOf` set to the children's question ids. When the human answers, relay it to each child with origin `human-relayed` and `relayItem`, then `session_answer` their questions.
+An orchestrator spawns its lanes with `session_spawn`, so it owns them and can stop them. It answers what the plan or the git state settles, and merges the rest into one `human_ask` with `onBehalfOf` set to the children's question ids. When the human answers, relay it to each child with origin `human-relayed` and `relayItem`, then `session_answer` their questions.
+
+## Spawning and owning sessions
+
+`session_spawn(folder, prompt, {role, fork, worktree})` starts a session you own. Give it a role so you can address it, and a prompt that points at the plan in git rather than pasting it (8 KB max). `worktree: {branch}` creates `~/dev/worktrees/<repo>/<branch>` first and runs the child there; `fork` starts it from a transcript. The child gets your prompt as a message from you, origin `agent`: it is never the human's approval. You can tell, ask and read it like any session, and it reports back with `session_tell`. `session_stop` ends its current turn (only that session, and only sessions you own); it stays and takes your next message. `session_list` and `session_read` show who owns what.
+
+If you were spawned, the first message says so and names your owner: report to it, and escalate to the human through `human_ask` only what your owner cannot settle.
 
 ## When a message arrives
 

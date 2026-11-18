@@ -18,11 +18,14 @@ const USAGE = `kenning: sessions that know about each other
   kenning ask TARGET QUESTION...                    ask a question
   kenning inbox [--json]                            the human's open attention items
   kenning answer ID TEXT...                         answer an inbox item (h_...) or a question (q_...)
+  kenning owned TARGET [--json]                     the sessions TARGET spawned (live or not), and its owner
+  kenning stop TARGET                               stop the current turn of a session (the human only)
 
 TARGET is a role (template-tree/push), a session file (.jsonl) or a session-id prefix.
 Run by a human at a terminal, tell, ask and answer are origin "human". Run from an
 agent's bash (PI_SESSION_FILE is set) they come from that session, origin "agent",
-and answer is refused: only the human answers the human's inbox.
+and answer and stop are refused: only the human answers the human's inbox, and
+an agent stops only the sessions it owns, with its session_stop tool.
 State: $KENNING_STATE_DIR, else $XDG_STATE_HOME/kenning.
 `;
 
@@ -76,7 +79,16 @@ export function runCli(argv: string[], io: CliIo): number {
 		io.stdout(USAGE);
 		return cmd ? 0 : 2;
 	}
-	const known = ['list', 'read', 'tell', 'ask', 'inbox', 'answer'];
+	const known = [
+		'list',
+		'read',
+		'tell',
+		'ask',
+		'inbox',
+		'answer',
+		'owned',
+		'stop',
+	];
 	if (!known.includes(cmd)) {
 		io.stderr(`kenning: unknown command ${cmd}\n\n${USAGE}`);
 		return 2;
@@ -160,17 +172,58 @@ export function runCli(argv: string[], io: CliIo): number {
 					);
 				return 0;
 			}
+			case 'owned': {
+				const r = k.resolve(need(rest[0], 'TARGET'));
+				if (!r.session) {
+					io.stdout(`${r.target}: nobody holds this role right now.\n`);
+					return 0;
+				}
+				const owned = k.ownedBy(r.session, {transitive: true});
+				const owner = k.ownerOf(r.session);
+				if (opts.json) {
+					io.stdout(
+						JSON.stringify({session: r.session, owner, owned}, null, 2) + '\n',
+					);
+					return 0;
+				}
+				const lines = [
+					`${r.session}${owner ? `\n  owner: ${owner}` : ''}`,
+					...owned.map((o) => {
+						const p = k!.presence(o.session!);
+						const bits = [
+							o.role ?? '(no role)',
+							p?.live ? p.state : 'not live',
+							o.folder,
+							`via ${o.via}`,
+							o.owner === r.session ? null : `owned by ${o.owner}`,
+							o.archived ? o.archived.kind : null,
+						].filter(Boolean);
+						return `  ${o.session}\n    ${bits.join(' · ')}`;
+					}),
+				];
+				if (!owned.length) lines.push('  owns no sessions');
+				io.stdout(lines.join('\n') + '\n');
+				return 0;
+			}
+			case 'stop': {
+				// D31: the human may stop any session's current turn; an agent stops
+				// only what it owns, through session_stop, where ownership is checked.
+				asHuman(who, 'stop');
+				const r = k.resolve(need(rest[0], 'TARGET'));
+				if (!r.session || !k.isLive(r.session)) {
+					io.stdout(
+						`${r.session ?? r.target} is not running: nothing to stop.\n`,
+					);
+					return 0;
+				}
+				const req = k.requestStop(r.session, {by: null});
+				io.stdout(
+					`stop requested (${req.id}): ${r.session} aborts its current turn within a second, if it is running. Sessions it owns are not stopped.\n`,
+				);
+				return 0;
+			}
 			case 'answer': {
-				if (who.kind === 'agent')
-					throw new KenningError(
-						'answer is refused from inside an agent session (PI_SESSION_FILE is set): only the human answers as the human',
-						'not-human',
-					);
-				if (who.kind !== 'human')
-					throw new KenningError(
-						'answer needs a terminal: only the human, at their terminal, answers as the human',
-						'not-human',
-					);
+				asHuman(who, 'answer');
 				const id = need(rest[0], 'ID');
 				const text = need(rest.slice(1).join(' '), 'TEXT');
 				if (id.startsWith('h_')) k.answerItem(id, text, {channel: 'cli'});
@@ -189,6 +242,19 @@ export function runCli(argv: string[], io: CliIo): number {
 	} finally {
 		k?.close();
 	}
+}
+
+function asHuman(who: ReturnType<typeof speaker>, verb: string): void {
+	if (who.kind === 'agent')
+		throw new KenningError(
+			`${verb} is refused from inside an agent session (PI_SESSION_FILE is set): only the human ${verb === 'stop' ? 'stops any session' : 'answers as the human'}`,
+			'not-human',
+		);
+	if (who.kind !== 'human')
+		throw new KenningError(
+			`${verb} needs a terminal: only the human, at their terminal, ${verb === 'stop' ? 'stops any session' : 'answers as the human'}`,
+			'not-human',
+		);
 }
 
 function need(v: string | undefined, what: string): string {

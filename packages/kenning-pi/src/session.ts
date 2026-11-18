@@ -11,8 +11,34 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import {formatDelivery} from './format.js';
 import {acquire, release} from './shared.js';
+import {
+	SPAWN_ENV,
+	WAKE_GAP_MS,
+	WAKE_LEASE_MS,
+	planWake,
+	startDetached,
+} from './spawn.js';
 
 export const CUSTOM_TYPE = 'kenning';
+
+/**
+ * How long a host's `kenning:human-input` mark stays valid (ADR 0003, D22). A
+ * host emits it immediately before the send, and pi runs `input` handlers first
+ * thing in `prompt()` and `sendUserMessage()`: measured mark-to-`input` latency
+ * on pi 1.4 is about 0.1 ms (0.51 ms worst of 20 sends). A send that never
+ * reaches the `input` handler (another extension returned `handled`, a terminal
+ * pi refused it while compacting) must not leave a mark behind that a later
+ * identical `extension` input, such as a scheduled `/standup`, would match. 5 s is
+ * 10,000 times the worst measured latency, room for a loaded event loop, yet far
+ * shorter than any schedule that could repeat the same text.
+ *
+ * The expiry is the backstop. A host that awaits its send closes the mark
+ * itself with `kenning:human-input-end` (D35), which leaves no window at all;
+ * a host that cannot (an extension's fire-and-forget `pi.sendUserMessage()`,
+ * like the @wherever-dev/pi bridge) relies on this. The real fix is pi
+ * carrying an origin on the send: earendil-works/pi#12291.
+ */
+export const HUMAN_MARK_TTL_MS = 5_000;
 
 type Boundary = {
 	entries: {
@@ -49,7 +75,15 @@ export class SessionController {
 	declaredWaiting = false;
 	/** Inside session_wait or a blocking human_ask: the tool does its own reporting. */
 	toolState: SessionState | null = null;
-	private humanMarks: HumanInputMark[] = [];
+	private humanMarks: (HumanInputMark & {at: number})[] = [];
+	/** When the current run started (kenning's clock), for stop requests (D30). */
+	private runStartedAt = 0;
+	/**
+	 * Set when a run ends aborted (Esc, or a stop): messages already pending then
+	 * wait for the next run instead of waking the session at once, or a stop
+	 * would undo itself (D30). Cleared when a run starts.
+	 */
+	private abortedAt: number | null = null;
 	private readonly listener = {onChange: () => this.onChange()};
 
 	constructor(private readonly pi: ExtensionAPI) {}
@@ -98,6 +132,7 @@ export class SessionController {
 			sessionId: ctx.sessionManager.getSessionId(),
 			cwd: ctx.cwd,
 		});
+		this.bindSpawn(file);
 		this.reconcile();
 		this.reclaimRole(ctx);
 		void this.refreshBranch();
@@ -105,8 +140,14 @@ export class SessionController {
 	}
 
 	shutdown(): void {
+		clearTimeout(this.recheck);
+		this.recheck = undefined;
 		if (this.kenning && this.file) {
 			try {
+				// Read everything: the next wake may come at once. Something still
+				// pending keeps the gap, so a child that cannot read is retried slowly.
+				if (!this.kenning.pendingFor(this.file).length)
+					this.kenning.wakeDone(this.file, 0);
 				this.kenning.unregister(this.file);
 			} catch {}
 			release(this.listener);
@@ -114,6 +155,25 @@ export class SessionController {
 		this.kenning = undefined;
 		this.file = undefined;
 		this.ctx = undefined;
+	}
+
+	/**
+	 * A terminal child kenning spawned binds itself to its spawn, once (D28):
+	 * this queues the owner's first prompt before `before_agent_start`. The
+	 * variable is removed so nothing this process starts inherits it.
+	 */
+	private bindSpawn(file: string): void {
+		const spawnId = process.env[SPAWN_ENV];
+		if (spawnId) {
+			delete process.env[SPAWN_ENV];
+			try {
+				this.kenning!.bindSpawn(spawnId, file);
+			} catch (e) {
+				this.notify(`kenning: ${(e as Error).message}`, 'warning');
+			}
+		}
+		// Up: a headless wake that started us is done (D29).
+		this.kenning!.wakeDone(file, WAKE_GAP_MS);
 	}
 
 	/** A resumed session re-claims the role it held; a fork (a copy in a new file) does not (D9). */
@@ -131,6 +191,9 @@ export class SessionController {
 			else roles.add(d.role);
 		}
 		if (flagRole) roles.add(flagRole);
+		// A spawned session's role is part of its ownership record (D23).
+		const spawnedAs = this.kenning!.ownership(this.file!)?.role;
+		if (spawnedAs) roles.add(spawnedAs);
 		for (const role of roles) {
 			try {
 				const r = this.kenning!.claimRole(this.file!, role);
@@ -170,6 +233,8 @@ export class SessionController {
 	onAgentStart(ctx: ExtensionContext): void {
 		this.ctx = ctx;
 		this.phase = 'running';
+		this.abortedAt = null;
+		if (this.active) this.runStartedAt = this.kenning!.now();
 		this.setState('running');
 	}
 
@@ -206,37 +271,89 @@ export class SessionController {
 
 	// ------------------------------------------------------------ human input
 
+	/** Drop marks older than HUMAN_MARK_TTL_MS. A monotonic clock: a wall-clock jump must not revive one. */
+	private dropExpiredMarks(): void {
+		const oldest = performance.now() - HUMAN_MARK_TTL_MS;
+		this.humanMarks = this.humanMarks.filter((m) => m.at >= oldest);
+	}
+
 	onHumanMark(data: unknown): void {
+		this.dropExpiredMarks();
 		const m = data as Partial<HumanInputMark> | undefined;
 		if (typeof m?.text === 'string' && typeof m.channel === 'string')
-			this.humanMarks.push({text: m.text, channel: m.channel});
+			this.humanMarks.push({
+				text: m.text,
+				channel: m.channel,
+				id: typeof m.id === 'string' ? m.id : undefined,
+				at: performance.now(),
+			});
 		if (this.humanMarks.length > 20) this.humanMarks.shift();
+	}
+
+	/**
+	 * The host's marked send has settled (D35): drop its mark if no input took
+	 * it. By id when the mark had one, else the oldest open mark with this text.
+	 * A mark already consumed is not here, so a late end is a no-op.
+	 */
+	onHumanMarkEnd(data: unknown): void {
+		this.dropExpiredMarks();
+		const e = data as {text?: unknown; id?: unknown} | undefined;
+		const i =
+			typeof e?.id === 'string'
+				? this.humanMarks.findIndex((m) => m.id === e.id)
+				: typeof e?.text === 'string'
+					? this.humanMarks.findIndex((m) => m.text === e.text && !m.id)
+					: -1;
+		if (i >= 0) this.humanMarks.splice(i, 1);
 	}
 
 	/** ADR 0003: TUI typing, or an input a host marked as human just before sending it. */
 	onInput(text: string, source: string): void {
 		if (!this.active) return;
 		if (source === 'interactive') {
-			this.kenning!.recordHumanTurn(this.file!, {text, channel: 'terminal'});
+			if (this.typedAtTerminal())
+				this.kenning!.recordHumanTurn(this.file!, {text, channel: 'terminal'});
 			return;
 		}
 		if (source !== 'extension') return;
+		this.dropExpiredMarks();
 		const i = this.humanMarks.findIndex((m) => m.text === text);
 		if (i < 0) return;
 		const [mark] = this.humanMarks.splice(i, 1);
 		this.kenning!.recordHumanTurn(this.file!, {text, channel: mark.channel});
 	}
 
+	/**
+	 * pi reports `pi -p TEXT` as source `interactive` too (print mode calls
+	 * `prompt()` with the default source), so outside the TUI the source alone
+	 * proves nothing: a headless child kenning spawned, a cron job or an agent's
+	 * bash running `pi -p "I approve"` would all count as the human (D27). Outside
+	 * the TUI it is the human only under the CLI's rule (D2): a terminal on stdin
+	 * and no agent session around it.
+	 */
+	private typedAtTerminal(): boolean {
+		if (this.ctx?.mode === 'tui') return true;
+		return !!process.stdin.isTTY && !process.env.PI_SESSION_FILE;
+	}
+
 	// ---------------------------------------------------------------- delivery
 
-	/** Anything changed in the database: maybe wake, maybe update the notices. */
+	/** Anything changed in the database: maybe stop, wake a child, wake, update the notices. */
 	private onChange(): void {
 		if (!this.active || !this.ctx) return;
 		try {
+			this.handleStops();
+			this.wakeOwned();
 			this.refreshNotices();
+			// A `pi -p` run never wakes itself: print mode prompts right after
+			// session_start, and a wake there made that prompt fail with "Agent is
+			// already processing" (measured). Its messages join the prompt at
+			// before_agent_start; later ones wait for the owner's next wake (D29).
+			if (this.ctx.mode === 'print' || this.ctx.mode === 'json') return;
 			if (this.phase !== 'settled' || !this.ctx.isIdle()) return;
+			const since = this.abortedAt ?? -Infinity;
 			const pending = this.kenning!.pendingFor(this.file!);
-			if (!pending.length) return;
+			if (!pending.some((m) => m.createdAt > since)) return;
 			const presence = this.kenning!.presence(this.file!);
 			const plan = planDelivery(
 				{
@@ -252,6 +369,60 @@ export class SessionController {
 		} catch (e) {
 			console.error('[kenning] delivery failed:', e);
 		}
+	}
+
+	/**
+	 * D30: a stop request for this session aborts the run that was going when it
+	 * was made, and only that; one made while settled, or before this run began,
+	 * is answered `not-running`. A read per poll; the write only when there is one.
+	 */
+	private handleStops(): void {
+		const k = this.kenning!;
+		for (const req of k.openStops(this.file!)) {
+			const running = this.phase === 'running' && this.runStartedAt <= req.at;
+			if (running) this.ctx!.abort();
+			k.settleStop(req.id, running ? 'stopped' : 'not-running');
+		}
+	}
+
+	/**
+	 * D29: this session's headless children are `pi -p` runs that exit when
+	 * done. When one is not running and has messages that arrived after its last
+	 * stop, start `pi --session <path> -p` for it, under a lease so no two polls
+	 * or processes start it twice. Only the owner wakes a child.
+	 */
+	private wakeOwned(): void {
+		const k = this.kenning!;
+		for (const o of k.wakeCandidates(this.file!)) {
+			const child = o.session!;
+			if (k.isLive(child)) continue;
+			const lease = k.leaseWake(child, WAKE_LEASE_MS);
+			if (!lease.ok) {
+				// Nothing may change in the database when the lease lapses: look again then.
+				if (lease.until) this.recheckAt(lease.until);
+				continue;
+			}
+			startDetached(
+				planWake({env: process.env, sessionFile: child, folder: o.folder}),
+				o.id,
+			).catch((e) =>
+				this.notify(
+					`kenning: could not wake ${child}: ${(e as Error).message}`,
+					'warning',
+				),
+			);
+		}
+	}
+
+	private recheck: ReturnType<typeof setTimeout> | undefined;
+	private recheckAt(at: number): void {
+		if (this.recheck) return;
+		const ms = Math.max(at - this.kenning!.now(), 0) + 50;
+		this.recheck = setTimeout(() => {
+			this.recheck = undefined;
+			this.onChange();
+		}, ms);
+		this.recheck.unref();
 	}
 
 	private editorBusy(): boolean {
@@ -305,7 +476,8 @@ export class SessionController {
 	}
 
 	/** turn_end: urgent messages, and everything held while a dialog was open. */
-	atTurnEnd(): Boundary | undefined {
+	atTurnEnd(aborted = false): Boundary | undefined {
+		if (aborted) return undefined; // a stopped turn must not be continued (D30)
 		const messages = this.take((m) => m.urgent || this.uiPrompt);
 		if (!messages.length) return undefined;
 		return {
@@ -317,7 +489,12 @@ export class SessionController {
 	}
 
 	/** agent_before_settle: everything that arrived during the run, read before stopping. */
-	atSettle(): Boundary | undefined {
+	atSettle(outcome?: string): Boundary | undefined {
+		if (outcome === 'aborted') {
+			// Esc or a stop: continuing would undo it. What is pending waits (D30).
+			this.abortedAt = this.active ? this.kenning!.now() : Date.now();
+			return undefined;
+		}
 		if (this.declaredWaiting) return undefined; // it just said it waits for the human: hold
 		const messages = this.take();
 		if (!messages.length) return undefined;

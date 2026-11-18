@@ -1,4 +1,5 @@
 import {
+	currentHost,
 	KenningError,
 	readTail,
 	type Origin,
@@ -13,11 +14,13 @@ import type {
 import {Type, type TSchema} from 'typebox';
 import {
 	formatItem,
+	formatOwnership,
 	formatPresence,
 	formatQuestion,
 	formatTail,
 } from './format.js';
 import type {SessionController} from './session.js';
+import {spawnSession} from './spawn.js';
 
 type Result = {
 	content: {type: 'text'; text: string}[];
@@ -141,15 +144,21 @@ export function registerTools(pi: ExtensionAPI, ctl: SessionController): void {
 		} as unknown as ToolDefinition);
 	};
 
+	const owners = (sessionFile: string) =>
+		formatOwnership(k(), sessionFile)
+			.map((l) => `\n  ${l}`)
+			.join('');
+
 	const summary = (sessionFile: string | null) => {
 		if (!sessionFile)
 			return '(nobody holds it right now: the message waits for the next holder)';
 		const p = k().presence(sessionFile);
 		if (!p || !p.live)
-			return `${sessionFile} (not live: the message waits until it resumes)`;
+			return `${sessionFile} (not live: the message waits until it resumes${k().ownership(sessionFile)?.via === 'headless' ? ', or its owner wakes it' : ''})`;
 		const qs = k().openQuestionsTo(sessionFile);
 		return (
 			formatPresence(p) +
+			owners(sessionFile) +
 			(qs.length
 				? `\n  open questions to it:\n  ${qs.map(formatQuestion).join('\n  ')}`
 				: '')
@@ -212,7 +221,7 @@ export function registerTools(pi: ExtensionAPI, ctl: SessionController): void {
 			k().update(self(), {status: p.status, refs: p.refs});
 			if (p.state === 'waiting-for-human') ctl.declaredWaiting = true;
 			if (p.state === 'idle') ctl.declaredWaiting = false;
-			out.push(formatPresence(k().presence(self())!));
+			out.push(formatPresence(k().presence(self())!) + owners(self()));
 			return ok(out.join('\n'));
 		},
 	});
@@ -238,7 +247,9 @@ export function registerTools(pi: ExtensionAPI, ctl: SessionController): void {
 				list
 					.map(
 						(x) =>
-							formatPresence(x) + (x.sessionFile === self() ? '  (you)' : ''),
+							formatPresence(x) +
+							(x.sessionFile === self() ? '  (you)' : '') +
+							owners(x.sessionFile),
 					)
 					.join('\n'),
 			);
@@ -264,6 +275,14 @@ export function registerTools(pi: ExtensionAPI, ctl: SessionController): void {
 			const r = k().resolve(p.target);
 			if (!r.session)
 				return ok(`${p.target}: nobody holds this role right now.`);
+			const p0 = k().presence(r.session);
+			if (!p0?.live) {
+				// summary() is short for a gone session; its ownership still matters.
+				const tail = readTail(r.session, {messages: 6});
+				return ok(
+					`${summary(r.session)}${owners(r.session)}\n\nrecent transcript:\n${formatTail(tail)}`,
+				);
+			}
 			const tail = readTail(r.session, {
 				messages: Math.min(Math.max(p.messages ?? 6, 1), 20),
 			});
@@ -406,6 +425,109 @@ export function registerTools(pi: ExtensionAPI, ctl: SessionController): void {
 				}
 			} finally {
 				ctl.setToolState(null);
+			}
+		},
+	});
+
+	tool({
+		name: 'session_spawn',
+		label: 'Session Spawn',
+		description:
+			'Start a new session that YOU own, in a folder, with a first prompt. The prompt reaches it as a kenning message from you (origin agent), never as the human. Optional: role (its address), fork (start from a transcript, up to entryId), worktree (create ~/dev/worktrees/<repo>/<branch> with git worktree add, and run there). Returns the new session file and its presence. You can session_tell, session_ask and session_read it, and stop its current turn with session_stop.',
+		promptSnippet: 'Start a session you own, with a first prompt (kenning)',
+		parameters: Type.Object({
+			folder: Type.String({
+				description:
+					'Folder to run in (relative to yours). With worktree, the repo the worktree is made from unless worktree.repo says otherwise.',
+			}),
+			prompt: Type.String({
+				description:
+					'Its first prompt (8 KB max: point at a plan in git rather than pasting it).',
+			}),
+			role: Type.Optional(Type.String()),
+			fork: Type.Optional(
+				Type.Object({
+					sessionFile: Type.String(),
+					entryId: Type.Optional(Type.String()),
+				}),
+			),
+			worktree: Type.Optional(
+				Type.Object({
+					repo: Type.Optional(Type.String()),
+					branch: Type.String(),
+				}),
+			),
+		}),
+		async run(p, _id, signal, ctx) {
+			const out = await spawnSession(
+				k(),
+				self(),
+				{
+					folder: p.folder,
+					prompt: p.prompt,
+					role: p.role,
+					fork: p.fork,
+					worktree: p.worktree,
+				},
+				{cwd: ctx.cwd, env: process.env, signal},
+			);
+			const o = out.ownership;
+			const head = o.session
+				? `spawned ${o.session} (you own it; via ${o.via}${out.note ? `, ${out.note}` : ''})`
+				: `spawn ${o.id}: ${out.note}`;
+			const body = out.presence
+				? formatPresence(out.presence)
+				: o.session
+					? `${o.session}\n  not live right now (a headless run may already be done); messages to it wake it`
+					: '';
+			return ok(`${head}\n${body}`, {
+				sessionFile: o.session,
+				spawnId: o.id,
+				via: o.via,
+			});
+		},
+	});
+
+	tool({
+		name: 'session_stop',
+		label: 'Session Stop',
+		description:
+			'Stop the CURRENT TURN of a session you own (directly, or through a session you own): its running agent is aborted, the session stays and takes new messages. Only that session; the sessions it owns go on. Refused for a session you do not own. Messages already pending for it wait for its next turn instead of restarting it.',
+		promptSnippet: 'Stop the current turn of a session you own (kenning)',
+		parameters: Type.Object({target: Type.String()}),
+		async run(p, _id, signal) {
+			const r = k().resolve(p.target);
+			if (!r.session)
+				return fail(`session_stop: nobody holds ${p.target} right now`);
+			const target = r.session;
+			if (!k().owns(self(), target))
+				return fail(
+					`session_stop: you do not own ${target}${k().ownerOf(target) ? ` (its owner is ${k().labelOf(k().ownerOf(target))})` : ''}. Only its owner, or the human with \`kenning stop\`, can stop it; session_tell it instead.`,
+				);
+			const host = currentHost();
+			if (host?.stop) {
+				const outcome = await host.stop(target, {by: self()});
+				if (outcome === 'stopped')
+					return ok(`stopped the current turn of ${target} (by its host)`);
+				if (outcome === 'not-running')
+					return ok(`${target} is not running: nothing to stop`);
+			}
+			if (!k().isLive(target))
+				return ok(`${target} is not running: nothing to stop`);
+			const req = k().requestStop(target, {by: self()});
+			// Its own extension acts within one poll (1 s by default).
+			const deadline = Date.now() + 5_000;
+			for (;;) {
+				const st = k().stopRequest(req.id)!;
+				if (st.outcome === 'stopped')
+					return ok(`stopped the current turn of ${target}`);
+				if (st.outcome === 'not-running')
+					return ok(`${target} was not running: nothing to stop`);
+				if (Date.now() > deadline || signal?.aborted)
+					return ok(
+						`stop requested (${req.id}); ${target} has not acted on it yet and will at its next poll`,
+					);
+				await sleep(100, signal);
 			}
 		},
 	});

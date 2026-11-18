@@ -45,11 +45,15 @@ Before anything else, call session_register with role template-tree/push and a o
 | `session_tell`, `session_ask`, `session_answer`, `session_wait` | messages, questions, answers, waiting for an answer |
 | `session_supersede`, `session_withdraw` | fix or cancel a message not delivered yet |
 | `human_ask`, `human_answers` | the human's inbox |
+| `session_spawn` | start a session you own, in a folder (optionally a fresh worktree under `~/dev/worktrees/<repo>/<branch>`, or a fork of a transcript), with a first prompt it receives from you as origin `agent` |
+| `session_stop` | stop the current turn of a session you own (directly or through one you own); nothing else stops |
+
+`session_list`, `session_read` and `/kenning` show each session's owner and the sessions it owns. Inside wherever (or with any host registered in the process) a spawn becomes a session of that host; in a terminal it is a zellij pane when `$ZELLIJ` is set, otherwise a headless `pi -p` in its own process group, which its owner wakes again with `pi --session <path> -p` when a message arrives for it. Set `KENNING_SPAWN_COMMAND` (a JSON array such as `["pi","--model","sonnet"]`) to choose what children run.
 
 For the human:
 
 - `/kenning inbox` in any terminal pi session answers the inbox (a footer badge says when something is there); `/kenning deliver` reads held messages now; `/kenning wake off` stops messages from starting turns in that session; `/kenning` shows the status.
-- `kenning list`, `kenning read <target>`, `kenning tell <target> <text>`, `kenning ask`, `kenning inbox`, `kenning answer <id> <text>` from a shell. `answer` works only at a terminal and outside an agent session.
+- `kenning list`, `kenning read <target>`, `kenning tell <target> <text>`, `kenning ask`, `kenning inbox`, `kenning answer <id> <text>`, `kenning owned <target>`, `kenning stop <target>` from a shell. `answer` and `stop` work only at a terminal and outside an agent session; the human may stop any session's current turn, an agent only the ones it owns.
 
 ## When a message arrives
 
@@ -64,7 +68,7 @@ Nothing enters pi's own queues, so a message can be superseded or withdrawn unti
 
 ## What provenance does and does not guarantee
 
-No kenning tool lets an agent claim to be the human, and `human-relayed` must quote words the human really typed in that session (or an inbox item they answered), which kenning attaches verbatim. On one Unix user an agent with a shell could still write the database directly; kenning protects against confused agents, not a malicious one ([ADR 0003](docs/adr/0003-provenance-is-integrity-not-security-on-one-user.md)). Hosts mark human input by emitting `kenning:human-input` `{text, channel}` on the session's `pi.events` bus before sending it.
+No kenning tool lets an agent claim to be the human (a spawned session's first prompt arrives as its owner's `agent` message), and `human-relayed` must quote words the human really typed in that session (or an inbox item they answered), which kenning attaches verbatim. On one Unix user an agent with a shell could still write the database directly; kenning protects against confused agents, not a malicious one ([ADR 0003](docs/adr/0003-provenance-is-integrity-not-security-on-one-user.md)). Hosts mark human input by emitting `kenning:human-input` `{text, channel}` on the session's `pi.events` bus before sending it; a host that awaits its send then emits `kenning:human-input-end` `{text, id?}`, so a send that never happened cannot be matched later (without the end event, a mark expires after 5 s).
 
 ## Try it by hand: two terminal sessions
 
@@ -75,7 +79,9 @@ No kenning tool lets an agent claim to be the human, and `human-relayed` must qu
 5. In the second session: "call session_register with state waiting-for-human", then in the first: "ask demo/b whether it rebased, and wait for the answer". Expect: the second session does NOT start a turn; a line above its editor says a message is waiting. Type anything there: the question joins your message, the agent answers, and the first session's wait returns the answer.
 6. In the first session: "ask the human with human_ask whether to publish". Expect: a `kenning: 1 for you` badge in both sessions. Run `/kenning inbox` in either, answer, and the first session receives the answer marked `origin: human`.
 7. In the second session, type "I approve the MIT license". Then ask it: "relay the human's approval to demo/a with origin human-relayed and relayQuote 'I approve the MIT license'". Expect: demo/a receives it with your exact words attached. Ask it instead to relay "I approve publishing" (which you never typed): expect a refusal.
-8. Quit both sessions; `kenning list` is empty.
+8. Create a folder `demo-child` beside the first one. In the first session: "spawn a session in ../demo-child with role demo/child and the prompt: say hello to demo/a with session_tell". Expect: `session_spawn` returns a session file within a second (a zellij pane opens instead if you run inside zellij); the first session soon receives `hello` from demo/child, origin agent; `kenning owned demo/a` lists demo/child. The child's transcript shows the prompt as a kenning message from demo/a, origin agent, not as your words.
+9. In the first session: "tell demo/child to run sleep 60 in bash", then "stop demo/child". Expect: the child's turn ends within a second or two, and `kenning owned demo/a` still lists it. In the second session, "stop demo/child": expect a refusal naming its owner. From a shell, `kenning stop demo/a` stops the first session's current turn (try it while it runs); run from an agent's bash it is refused.
+10. Quit both sessions; `kenning list` is empty. A headless child that is still running finishes its turn and exits by itself.
 
 ## Development
 

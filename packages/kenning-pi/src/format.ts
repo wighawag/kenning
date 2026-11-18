@@ -1,4 +1,11 @@
-import type {AttentionItem, Message, Presence, Question, Tail} from 'kenning';
+import type {
+	AttentionItem,
+	Kenning,
+	Message,
+	Presence,
+	Question,
+	Tail,
+} from 'kenning';
 
 /** What every delivered message carries to the model about provenance (ADR 0003). */
 const ORIGIN_RULE =
@@ -42,6 +49,11 @@ export function formatDelivery(
 	];
 	for (const m of messages) lines.push(header(m), body(m));
 	lines.push('---');
+	const spawn = messages.find((m) => m.kind === 'spawn');
+	if (spawn)
+		lines.push(
+			`${spawn.fromLabel} (${spawn.from}) spawned this session and owns it: the spawn message is your first prompt, from that session, not from the human. Report back to it with session_tell; it may stop your turn with session_stop.`,
+		);
 	if (messages.some((m) => m.kind === 'ask'))
 		lines.push(
 			'Answer a question with session_answer and its questionId; tell or ask back with session_tell / session_ask.',
@@ -66,6 +78,28 @@ export function formatPresence(p: Presence): string {
 		p.live ? null : 'GONE',
 	].filter(Boolean);
 	return `${p.sessionFile}\n  ${bits.join(' · ')}`;
+}
+
+/** A session's owner and the sessions it owns (D23), as lines for status output. */
+export function formatOwnership(k: Kenning, sessionFile: string): string[] {
+	const lines: string[] = [];
+	const owner = k.ownerOf(sessionFile);
+	if (owner) lines.push(`owner: ${k.labelOf(owner)} (${owner})`);
+	const owned = k.ownedBy(sessionFile);
+	if (owned.length) {
+		lines.push(`owns ${owned.length}:`);
+		for (const o of owned) {
+			const p = k.presence(o.session!);
+			const bits = [
+				o.role ?? '(no role)',
+				p?.live ? p.state : 'not live',
+				`via ${o.via}`,
+				o.archived ? o.archived.kind : null,
+			].filter(Boolean);
+			lines.push(`  ${o.session} · ${bits.join(' · ')}`);
+		}
+	}
+	return lines;
 }
 
 export function formatQuestion(q: Question): string {

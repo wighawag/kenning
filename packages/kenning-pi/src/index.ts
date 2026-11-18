@@ -1,6 +1,10 @@
-import {HUMAN_INPUT_EVENT, silenceSqliteWarning} from 'kenning';
+import {
+	HUMAN_INPUT_END_EVENT,
+	HUMAN_INPUT_EVENT,
+	silenceSqliteWarning,
+} from 'kenning';
 import type {ExtensionAPI} from '@earendil-works/pi-coding-agent';
-import {formatItem, formatPresence} from './format.js';
+import {formatItem, formatOwnership, formatPresence} from './format.js';
 import {CUSTOM_TYPE, SessionController} from './session.js';
 import {registerTools} from './tools.js';
 
@@ -33,6 +37,7 @@ export default function extension(pi: ExtensionAPI): void {
 
 	// A host marks the human input it is about to send (ADR 0003, D22).
 	pi.events.on(HUMAN_INPUT_EVENT, (data) => ctl.onHumanMark(data));
+	pi.events.on(HUMAN_INPUT_END_EVENT, (data) => ctl.onHumanMarkEnd(data));
 	pi.on('input', (event) => {
 		ctl.onInput(event.text, event.source);
 		return {action: 'continue'};
@@ -52,8 +57,8 @@ export default function extension(pi: ExtensionAPI): void {
 	});
 	pi.on('agent_start', (_event, ctx) => ctl.onAgentStart(ctx));
 	pi.on('turn_start', () => ctl.onTurnStart());
-	pi.on('turn_end', () => ctl.atTurnEnd());
-	pi.on('agent_before_settle', () => ctl.atSettle());
+	pi.on('turn_end', (event) => ctl.atTurnEnd(event.outcome === 'aborted'));
+	pi.on('agent_before_settle', (event) => ctl.atSettle(event.outcome));
 	pi.on('agent_settled', (_event, ctx) => ctl.onSettled(ctx));
 	pi.on('message_end', (event) => {
 		const m = event.message as {role?: string; customType?: string};
@@ -131,6 +136,7 @@ export default function extension(pi: ExtensionAPI): void {
 			const me = k.presence(ctl.file!);
 			const lines = [
 				me ? formatPresence(me) : ctl.file!,
+				...formatOwnership(k, ctl.file!),
 				`held messages: ${k.pendingFor(ctl.file!).length}`,
 				`open questions to you: ${k.openQuestionsTo(ctl.file!).length}`,
 				`human inbox: ${k.inbox().length}`,

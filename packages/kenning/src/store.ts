@@ -19,7 +19,7 @@ const BUSY_TIMEOUT_MS = 5_000;
  * message or an open question exists nowhere else, so it is never dropped and
  * rebuilt (ADR 0001). Append a migration; never edit one that shipped.
  */
-const MIGRATIONS: string[] = [
+export const MIGRATIONS: string[] = [
 	`
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
@@ -121,6 +121,48 @@ CREATE TABLE human_turn(
   at INTEGER NOT NULL
 );
 CREATE INDEX human_turn_session ON human_turn(session_file, at);
+`,
+	// 2: ownership, archive markers and stop requests (D23, D24, D30).
+	`
+-- Who spawned a session (D23). A row is created when the spawn starts, before
+-- the new session exists; session_file is set once, when it does, and the owner
+-- never changes. It outlives presence and is pruned only as D25 says.
+CREATE TABLE ownership(
+  id TEXT PRIMARY KEY,              -- the spawn, sp_...
+  session_file TEXT UNIQUE,         -- NULL until the new session exists
+  owner TEXT NOT NULL,
+  folder TEXT NOT NULL,
+  role TEXT,
+  via TEXT NOT NULL,                -- 'host' | 'zellij' | 'headless' | 'recorded'
+  detail TEXT,                      -- JSON: fork, worktree, host
+  prompt TEXT,                      -- the first prompt, delivered once at bind
+  created_at INTEGER NOT NULL,
+  bound_at INTEGER,
+  wake_until INTEGER                -- a headless wake in flight (D29)
+);
+CREATE INDEX ownership_owner ON ownership(owner);
+
+-- A host archived or deleted a session and its owned ones (D24).
+CREATE TABLE archive(
+  session_file TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,               -- 'archived' | 'deleted'
+  batch TEXT NOT NULL,
+  by_label TEXT NOT NULL,
+  at INTEGER NOT NULL
+);
+CREATE INDEX archive_batch ON archive(batch);
+
+-- Stop the current turn of a session (D30): its own extension acts on it.
+CREATE TABLE stop_request(
+  id TEXT PRIMARY KEY,
+  session_file TEXT NOT NULL,
+  by_session TEXT,
+  by_label TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  handled_at INTEGER,
+  outcome TEXT                      -- 'stopped' | 'not-running'
+);
+CREATE INDEX stop_open ON stop_request(session_file, handled_at);
 `,
 ];
 

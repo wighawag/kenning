@@ -104,6 +104,58 @@ describe('kenning CLI', () => {
 		k.close();
 	});
 
+	it('owned lists what a session spawned, live or not, and its own owner', () => {
+		const {dir, k} = seeded();
+		k.recordOwnership({
+			session: B,
+			owner: A,
+			folder: '/r/missiv',
+			role: 'plan/messaging',
+			via: 'headless',
+		});
+		k.recordOwnership({
+			session: '/s/gone/c.jsonl',
+			owner: B,
+			folder: '/r/c',
+			via: 'zellij',
+		});
+		const r = cli(dir, ['owned', 'template-tree/push']);
+		expect(r.code).toBe(0);
+		expect(r.out).toContain(B);
+		expect(r.out).toContain('plan/messaging');
+		expect(r.out).toContain('/s/gone/c.jsonl');
+		expect(r.out).toContain(`owned by ${B}`);
+		expect(r.out).toContain('not live');
+		expect(cli(dir, ['owned', 'bbb']).out).toContain(`owner: ${A}`);
+		const json = JSON.parse(cli(dir, ['owned', A, '--json']).out);
+		expect(json.owned.map((o: {session: string}) => o.session)).toEqual([
+			B,
+			'/s/gone/c.jsonl',
+		]);
+		k.close();
+	});
+
+	it('stop is the human at a terminal only, for any live session, and asks for the current turn only', () => {
+		const {dir, k} = seeded();
+		expect(cli(dir, ['stop', 'bbb'], {tty: false})).toMatchObject({
+			code: 1,
+			err: expect.stringContaining('terminal'),
+		});
+		expect(
+			cli(dir, ['stop', 'bbb'], {env: {PI_SESSION_FILE: A}}),
+		).toMatchObject({code: 1, err: expect.stringContaining('agent session')});
+		expect(k.openStops(B)).toEqual([]);
+
+		const r = cli(dir, ['stop', 'bbb']);
+		expect(r.code).toBe(0);
+		expect(r.out).toContain('Sessions it owns are not stopped');
+		expect(k.openStops(B)).toMatchObject([{by: null, byLabel: 'human'}]);
+		expect(cli(dir, ['stop', '/s/nobody/x.jsonl']).out).toContain(
+			'not running',
+		);
+		k.close();
+	});
+
 	it('reports errors plainly', () => {
 		const {dir, k} = seeded();
 		expect(cli(dir, ['tell', 'nobody', 'x'])).toMatchObject({

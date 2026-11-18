@@ -7,6 +7,52 @@ const here = path.dirname(new URL(import.meta.url).pathname);
 const KENNING_PI = path.resolve(here, '../src/index.ts');
 const BRAIN = path.resolve(here, 'fixtures/brain.ts');
 const HOST = path.resolve(here, 'fixtures/host.ts');
+export const FAKE_HOST = path.resolve(here, 'fixtures/fake-host.ts');
+
+/** pi on the scripted model with only kenning and the fixtures loaded; also what spawned children run. */
+function piCommand(world: World): string[] {
+	return [
+		'pi',
+		'--no-extensions',
+		'--no-skills',
+		'--no-prompt-templates',
+		'--no-context-files',
+		'-e',
+		KENNING_PI,
+		'-e',
+		BRAIN,
+		'-e',
+		HOST,
+		'--provider',
+		'faux',
+		'--model',
+		'brain',
+		'--session-dir',
+		world.sessionDir,
+	];
+}
+
+/** The environment every test pi, and everything it starts, runs with. */
+export function testEnv(world: World): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {
+		...process.env,
+		KENNING_STATE_DIR: world.stateDir,
+		KENNING_POLL_MS: '100',
+		KENNING_SPAWN_COMMAND: JSON.stringify(piCommand(world)),
+		KENNING_WORKTREES_DIR: path.join(world.root, 'worktrees'),
+		KENNING_TEST_SESSION_DIR: world.sessionDir,
+		KENNING_TEST_HOST_LOG: path.join(world.root, 'host.jsonl'),
+		PI_CODING_AGENT_DIR: world.agentDir,
+		PI_OFFLINE: '1',
+		PI_SKIP_VERSION_CHECK: '1',
+	};
+	delete env.PI_SUBAGENT_CHILD;
+	delete env.KENNING_ROLE;
+	delete env.KENNING_SPAWN;
+	// A developer running the suite inside zellij must not get panes.
+	delete env.ZELLIJ;
+	return env;
+}
 
 export type Event = {type: string; [k: string]: any};
 
@@ -41,41 +87,13 @@ export class Pi {
 	static start(world: World, name: string, extra: string[] = []): Pi {
 		const cwd = path.join(world.root, name);
 		fs.mkdirSync(cwd, {recursive: true});
-		const env: NodeJS.ProcessEnv = {
-			...process.env,
-			KENNING_STATE_DIR: world.stateDir,
-			KENNING_POLL_MS: '100',
-			PI_CODING_AGENT_DIR: world.agentDir,
-			PI_OFFLINE: '1',
-			PI_SKIP_VERSION_CHECK: '1',
-		};
-		delete env.PI_SUBAGENT_CHILD;
-		delete env.KENNING_ROLE;
-		const proc = spawn(
-			'pi',
-			[
-				'--mode',
-				'rpc',
-				'--no-extensions',
-				'--no-skills',
-				'--no-prompt-templates',
-				'--no-context-files',
-				'-e',
-				KENNING_PI,
-				'-e',
-				BRAIN,
-				'-e',
-				HOST,
-				'--provider',
-				'faux',
-				'--model',
-				'brain',
-				'--session-dir',
-				world.sessionDir,
-				...extra,
-			],
-			{cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe']},
-		) as ChildProcessWithoutNullStreams;
+		const [cmd, ...args] = piCommand(world);
+		const proc = spawn(cmd, ['--mode', 'rpc', ...args, ...extra], {
+			cwd,
+			env: testEnv(world),
+			detached: true,
+			stdio: ['pipe', 'pipe', 'pipe'],
+		}) as ChildProcessWithoutNullStreams;
 		const pi = new Pi(name, proc);
 		world.procs.push(pi);
 		return pi;
@@ -137,10 +155,20 @@ export class Pi {
 		});
 	}
 
-	send(cmd: object): void {
-		this.proc.stdin.write(
-			JSON.stringify({id: `c${this.nextId++}`, ...cmd}) + '\n',
-		);
+	send(cmd: object): string {
+		const id = `c${this.nextId++}`;
+		this.proc.stdin.write(JSON.stringify({id, ...cmd}) + '\n');
+		return id;
+	}
+
+	/** Send a prompt that starts no run (a slash command) and wait for pi's response to it. */
+	async command(text: string): Promise<Event> {
+		const from = this.mark();
+		const id = this.send({type: 'prompt', message: text});
+		return this.waitFor((e) => e.type === 'response' && e.id === id, {
+			from,
+			what: `response to ${text.slice(0, 40)}`,
+		});
 	}
 
 	/** Prompt and wait until the run fully settles. */
@@ -194,9 +222,60 @@ export function newWorld(): World {
 	return w;
 }
 
-export async function endWorld(w: World): Promise<void> {
+/**
+ * Stop the world, and return the processes that LEAKED: still alive 3 s after
+ * the test's own pi processes stopped. Spawned children lead their own process
+ * groups, so stopping a test pi does not reach them; a host child is stopped by
+ * its host's shutdown and a headless child exits when done, so anything left
+ * after the grace period is a leak. They are killed by group either way, but
+ * the caller asserts on the list (invariant 8), so a leak fails the suite.
+ */
+export async function endWorld(w: World): Promise<number[]> {
 	await Promise.all(w.procs.map((p) => p.stop()));
+	const grace = Date.now() + 3000;
+	while (survivors(w).length && Date.now() < grace)
+		await new Promise((r) => setTimeout(r, 50));
+	const leaked = survivors(w);
+	for (const pid of leaked) {
+		try {
+			process.kill(-pid, 'SIGKILL');
+		} catch {}
+		try {
+			process.kill(pid, 'SIGKILL');
+		} catch {}
+	}
+	const end = Date.now() + 3000;
+	while (survivors(w).length && Date.now() < end)
+		await new Promise((r) => setTimeout(r, 50));
 	fs.rmSync(w.root, {recursive: true, force: true});
+	return leaked;
+}
+
+/**
+ * Every live process started for this world, at any depth: they all carry
+ * KENNING_STATE_DIR=<this world's state dir> in their environment. Reads
+ * /proc/<pid>/environ (Linux); a process we may not read is not ours.
+ */
+export function survivors(w: World): number[] {
+	const needle = Buffer.from(`KENNING_STATE_DIR=${w.stateDir}\0`);
+	const out: number[] = [];
+	let pids: string[] = [];
+	try {
+		pids = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d));
+	} catch {
+		return out;
+	}
+	for (const d of pids) {
+		const pid = Number(d);
+		if (pid === process.pid) continue;
+		try {
+			if (fs.readFileSync(`/proc/${d}/environ`).includes(needle)) {
+				const stat = fs.readFileSync(`/proc/${d}/stat`, 'utf8');
+				if (stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z') out.push(pid);
+			}
+		} catch {}
+	}
+	return out;
 }
 
 /** True if any process of these groups is still alive. */
