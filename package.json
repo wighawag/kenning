@@ -1,0 +1,19 @@
+{
+	"name": "kenning-monorepo",
+	"private": true,
+	"type": "module",
+	"license": "AGPL-3.0-only",
+	"devDependencies": {
+		"@changesets/cli": "^2.29.8",
+		"prettier": "^3.8.4"
+	},
+	"scripts": {
+		"preinstall": "npx only-allow pnpm",
+		"prepublishOnly": "pnpm format:check && pnpm build && pnpm test",
+		"release": "pnpm prepublishOnly && pnpm changeset publish",
+		"format": "prettier --write .",
+		"format:check": "prettier --check .",
+		"build": "pnpm --filter './packages/*' build",
+		"test": "pnpm --filter './packages/*' test"
+	}
+}
