@@ -1,6 +1,6 @@
 {
 	"name": "kenning",
-	"version": "0.0.0",
+	"version": "0.1.0",
 	"description": "Sessions that know about each other: presence, roles, messages with provenance, questions and an attention inbox for agent sessions (pi and friends), on SQLite",
 	"license": "AGPL-3.0-only",
 	"repository": {
