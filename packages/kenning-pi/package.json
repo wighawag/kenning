@@ -1,6 +1,6 @@
 {
 	"name": "kenning-pi",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"description": "pi extension for kenning: let pi sessions see, message and ask each other, and raise questions to the human's inbox",
 	"license": "AGPL-3.0-only",
 	"repository": {
