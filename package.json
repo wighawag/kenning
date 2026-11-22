@@ -1,5 +1,5 @@
 {
-	"name": "kenning-monorepo",
+	"name": "shipmates-monorepo",
 	"private": true,
 	"type": "module",
 	"packageManager": "pnpm@11.25.0",

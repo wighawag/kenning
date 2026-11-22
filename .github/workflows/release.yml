@@ -1,6 +1,6 @@
 name: release
 
-# Changesets release flow, the only way kenning publishes (there is no local
+# Changesets release flow, the only way shipmates publishes (there is no local
 # release script):
 #   1. Land commits that include a changeset (`.changeset/*.md`) on main.
 #   2. This workflow opens or updates a "Version Packages" PR that bumps the
@@ -10,7 +10,7 @@ name: release
 #
 # Auth is npm Trusted Publishing (OIDC): there is NO NPM_TOKEN secret. npm trusts
 # this repository and this file (release.yml) through the trusted publisher
-# registered on each package (kenning, kenning-pi). The handshake needs
+# registered on each package (shipmates, @shipmates/pi). The handshake needs
 # `id-token: write` and Node >= 22 (an npm with OIDC support).
 on:
   push:

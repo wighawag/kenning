@@ -1,7 +1,7 @@
 ---
 name: ralph-loop
 disable-model-invocation: true
-description: Run a plan as a Ralph loop through kenning, one fresh worker session per step, each step reviewed, pushes gated by the approval policy the human gives.
+description: Run a plan as a Ralph loop through shipmates, one fresh worker session per step, each step reviewed, pushes gated by the approval policy the human gives.
 license: AGPL-3.0-only
 ---
 
@@ -9,7 +9,7 @@ license: AGPL-3.0-only
 
 You are the **orchestrator** of a Ralph loop. A plan in git is done one step at a time, each step by a fresh **worker** session running the same step prompt, so no step inherits another's context. You never build a step yourself: you spawn, route, review, gate and keep the loop moving. The plan in git is the only state; your memory is a cache of it.
 
-The tools are kenning's (`session_*`, `human_ask`); read the `kenning` skill (in this package, beside this one) if it is not in your context yet.
+The tools are shipmates' (`session_*`, `human_ask`); read the `shipmates` skill (in this package, beside this one) if it is not in your context yet.
 
 ## The brief
 
@@ -52,7 +52,7 @@ These always go to the human, whatever the approval policy: deleting a branch or
    - a reviewer's verdict: `ISSUES` within the fix rounds goes back to the worker (`session_tell`, the issues verbatim), and its next `DONE` is reviewed again; otherwise go to the gate.
    - `PUSHED <step>` from a worker: the step is complete. Check the plan at its ref shows it ticked, count it, and spawn the next step while the budget allows.
 5. **The gate.** Decide by the approval policy and the guardrails:
-   - **Go ahead**: `session_tell` the worker "push the listed refs now", with origin `human-relayed` and `relayQuote` set to the sentence of the brief that grants the approval. Only the human's own words satisfy a push gate, and kenning refuses words the human never typed. kenning searches the human's last 20 messages in your session; when the brief is older, ask the human to restate the approval.
+   - **Go ahead**: `session_tell` the worker "push the listed refs now", with origin `human-relayed` and `relayQuote` set to the sentence of the brief that grants the approval. Only the human's own words satisfy a push gate, and shipmates refuses words the human never typed. shipmates searches the human's last 20 messages in your session; when the brief is older, ask the human to restate the approval.
    - **Ask the human**: one non-blocking `human_ask` with options `Approve` and `Hold`, whose question names the step, the pushes, the review verdict and the reason you ask. On `Approve`, relay it to the worker with origin `human-relayed` and `relayItem`; on `Hold` or any other answer, pass the human's words to the worker and follow them.
 6. **Keep the status line current**: the step, its phase (building, review round N, at the gate, pushing) and steps done out of the budget.
 7. **Stop** when the budget is spent, the plan has no next step, or every lane waits on the human. End with a report in your chat: the steps completed with their pushes, what is open and on whom, and what comes next. If `assistant_notify` is available, send it the one-line summary.

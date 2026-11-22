@@ -1,5 +1,5 @@
 node_modules/
 dist/
 .env*.local
-# the skill has one home, `skills/` at the repo root; kenning-pi stages a copy at build time
+# the skill has one home, `skills/` at the repo root; @shipmates/pi stages a copy at build time
 packages/*/skills/

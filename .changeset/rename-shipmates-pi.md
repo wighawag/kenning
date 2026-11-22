@@ -1,0 +1,5 @@
+---
+"@shipmates/pi": minor
+---
+
+Renamed from `kenning-pi` to `@shipmates/pi` (spec D38). This package was published as `kenning-pi` up to 0.2.0; it continues here, and `kenning-pi` is deprecated. What users must change: replace `npm:kenning-pi` with `npm:@shipmates/pi` in pi's settings (`pi remove npm:kenning-pi`, then `pi install npm:@shipmates/pi`), and rename the environment variables `KENNING_STATE_DIR`, `KENNING_POLL_MS`, `KENNING_WORKTREES_DIR`, `KENNING_ROLE`, `KENNING_SPAWN` and `KENNING_SPAWN_COMMAND` to their `SHIPMATES_*` names. The skill is now `shipmates` (was `kenning`; `ralph-loop` keeps its name), the command is `/shipmates` (was `/kenning`), the flag is `--shipmates-role` (was `--kenning-role`), and delivered messages are of type `shipmates` with the header `[shipmates]`. The session tools keep their names (`session_*`, `human_ask`, `human_answers`). Nothing reads the old state directory or the old `kenning-role` transcript entries, so a session from before the rename must re-declare its role when resumed (`session_register`, `--shipmates-role` or `SHIPMATES_ROLE`).

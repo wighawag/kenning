@@ -2,7 +2,7 @@ packages:
   - "packages/*"
 
 # pnpm 11 requires an explicit decision on install scripts. These arrive only
-# through @earendil-works/pi-coding-agent, which kenning-pi needs for types and
+# through @earendil-works/pi-coding-agent, which @shipmates/pi needs for types and
 # for the faux model in tests; none of them needs to run code at install time.
 allowBuilds:
   '@google/genai': false

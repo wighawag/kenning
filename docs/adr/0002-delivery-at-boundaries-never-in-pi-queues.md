@@ -2,9 +2,9 @@
 
 **Status:** accepted (2026-11-17)
 
-pi can queue a message into a running session (`deliverAs: "steer" | "followUp" | "nextTurn"`), but once queued it can never be withdrawn or superseded (the extension API has no way to remove a queued message), and it lives only in memory, so a crash loses it. kenning needs supersede and withdraw (the 2026-11-17 push lane rewrote its first, wrong messages), and exactly-once delivery.
+pi can queue a message into a running session (`deliverAs: "steer" | "followUp" | "nextTurn"`), but once queued it can never be withdrawn or superseded (the extension API has no way to remove a queued message), and it lives only in memory, so a crash loses it. shipmates needs supersede and withdraw (the 2026-11-17 push lane rewrote its first, wrong messages), and exactly-once delivery.
 
-So a message stays in kenning until the last moment and is decided then:
+So a message stays in shipmates until the last moment and is decided then:
 
 - running: returned as `custom_message` entries from `agent_before_settle` with `continue: true` (the agent reads it before it stops), or from `turn_end` when marked urgent;
 - idle: `pi.sendMessage(..., {triggerTurn: true})`;

@@ -1,0 +1,51 @@
+{
+	"name": "shipmates",
+	"version": "0.1.1",
+	"description": "Sessions that know about each other: presence, roles, messages with provenance, questions and an attention inbox for agent sessions (pi and friends), on SQLite",
+	"license": "AGPL-3.0-only",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/wighawag/shipmates.git",
+		"directory": "packages/shipmates"
+	},
+	"keywords": [
+		"agents",
+		"sessions",
+		"messaging",
+		"coordination",
+		"pi",
+		"sqlite",
+		"cli"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"type": "module",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"bin": {
+		"shipmates": "./dist/cli.js"
+	},
+	"files": [
+		"dist",
+		"src"
+	],
+	"engines": {
+		"node": ">=22.5.0"
+	},
+	"devDependencies": {
+		"@types/node": "^25.2.0",
+		"tsx": "^4.23.15",
+		"typescript": "^5.3.3",
+		"vitest": "^4.0.18"
+	},
+	"scripts": {
+		"build": "tsc",
+		"test": "vitest run",
+		"test:watch": "vitest"
+	}
+}
