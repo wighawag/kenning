@@ -19,7 +19,7 @@
 
 - `packages/kenning`: the core (`Kenning` in `src/kenning.ts` is the one deep module), the transcript tail reader, the delivery planner, the change watcher, the host-interface types, and the CLI (`src/cli-run.ts`, testable; `src/cli.ts` is the bin). No runtime dependencies.
 - `packages/kenning-pi`: the extension. `src/session.ts` is one session's presence and delivery (and acting on stop requests, waking its headless children), `src/tools.ts` the tools, `src/spawn.ts` spawning (the registered host, else the terminal default, worktrees, forks), `src/shared.ts` the one connection and watcher per process, `src/index.ts` only wiring. Depends on the core, never the other way round. The host registry is in the core's `src/host.ts`, on `globalThis` (ADR 0008).
-- `skills/kenning/SKILL.md` is the skill's only home; `kenning-pi`'s build copies it.
+- `skills/` is the skills' only home (`kenning`, model-invoked; `ralph-loop`, typed by the human to run a plan as an orchestrated loop); `kenning-pi`'s build copies the folder.
 
 ## Measured facts
 
