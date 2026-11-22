@@ -1,6 +1,6 @@
 {
 	"name": "@shipmates/pi",
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"description": "pi extension for shipmates: let pi sessions see, message and ask each other, and raise questions to the human's inbox",
 	"license": "AGPL-3.0-only",
 	"repository": {
