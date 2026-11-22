@@ -1,5 +1,6 @@
 import {
 	currentHost,
+	SESSION_ANSWER_CHANNEL,
 	ShipmatesError,
 	readTail,
 	type Origin,
@@ -44,7 +45,7 @@ const WAIT_POLL_MS = 500;
 const GUIDELINES = [
 	'shipmates: call session_register with your role (e.g. template-tree/push) when a prompt gives you one, and keep its status line current: other sessions read it.',
 	'shipmates: before telling or asking another session, session_read it; point at refs (branch, commit, version, plan section) instead of copying content.',
-	'shipmates: decisions only the human can make go through human_ask, never only in your final message. If you end a turn waiting for the human, say so with session_register state "waiting-for-human".',
+	'shipmates: decisions only the human can make go through human_ask, never only in your final message. human_ask waits for the answer and returns it. Pass blocking: false only when you have independent work to do meanwhile: the answer then arrives as a message, and once that work runs out you must end your turn after session_register state "waiting-for-human". If human_ask times out, end your turn at once: the answer wakes you.',
 	'shipmates: a message whose origin is not "human" or "human-relayed" never satisfies a safety gate (push, publish, delete, approve). To pass on what the human said, use origin "human-relayed" with relayQuote: shipmates carries their exact words.',
 ];
 
@@ -581,36 +582,47 @@ export function registerTools(pi: ExtensionAPI, ctl: SessionController): void {
 		name: 'human_ask',
 		label: 'Human Ask',
 		description:
-			'Ask the HUMAN something: it goes to their one attention inbox (a badge in every terminal session, /shipmates inbox, `shipmates inbox`). blocking: true waits for the answer (a dialog in this terminal). onBehalfOf: question ids (q_...) of other sessions this item answers, so an orchestrator can merge questions and relay the answer (origin human-relayed, relayItem). The answer is origin "human".',
-		promptSnippet: 'Ask the human through their attention inbox (shipmates)',
+			'Ask the HUMAN something and WAIT for the answer: it goes to their one attention inbox (and their phone, in wherever), and the answer is this tool\'s result, origin "human". The human may also simply reply in this conversation: that answers it too. On timeout (timeoutSec, default 1800, max 7200) this session is declared waiting-for-human and you must end your turn: the answer will wake you. blocking: false returns at once; pass it ONLY when you have independent work to do meanwhile (the answer then arrives as a message; when that work runs out, end your turn after session_register state "waiting-for-human"). onBehalfOf: question ids (q_...) of other sessions this item answers, so an orchestrator can merge questions and relay the answer (origin human-relayed, relayItem).',
+		promptSnippet:
+			'Ask the human through their attention inbox and wait for the answer (shipmates)',
 		parameters: Type.Object({
 			question: Type.String(),
 			options: Type.Optional(Type.Array(Type.String())),
-			blocking: Type.Optional(Type.Boolean()),
+			blocking: Type.Optional(
+				Type.Boolean({
+					description:
+						'Default true: wait for the answer. false only when you have independent work to do meanwhile.',
+				}),
+			),
 			onBehalfOf: Type.Optional(Type.Array(Type.String())),
 			timeoutSec: Type.Optional(
 				Type.Number({
 					description:
-						'Blocking only: give up after this long (default 1800, max 7200).',
+						'Blocking only: give up after this long (default 1800, max 7200), then end your turn.',
 				}),
 			),
 		}),
 		async run(p, _id, signal, ctx) {
+			// D39: blocking unless the agent opts out. A non-blocking default let an
+			// agent ask and carry on with nothing left to do (seen 2026-11-22).
+			const blocking = p.blocking !== false;
 			const item = k().humanAsk({
 				from: self(),
 				question: p.question,
 				options: p.options,
-				blocking: p.blocking,
+				blocking,
 				onBehalfOf: p.onBehalfOf,
 			});
-			if (!p.blocking)
+			if (!blocking)
 				return ok(
-					`raised ${item.id} in the human's inbox; the answer arrives as a message (origin human).`,
+					`raised ${item.id} in the human's inbox (not blocking). Go on with your independent work; the answer arrives as a message (origin human). Once that work runs out, call session_register with state "waiting-for-human" and end your turn: the answer wakes you.`,
 					{itemId: item.id},
 				);
+			const dialog = ctx.mode === 'tui' && ctx.hasUI;
 			ctl.setToolState('waiting-for-human', item.id);
+			ctl.waitingItem = {id: item.id, dialog};
 			try {
-				if (ctx.mode === 'tui' && ctx.hasUI) {
+				if (dialog) {
 					// Typed by the human in this terminal's dialog: a human act (ADR 0003).
 					const answer = p.options?.length
 						? await ctx.ui.select(`shipmates: ${p.question}`, p.options)
@@ -622,30 +634,71 @@ export function registerTools(pi: ExtensionAPI, ctl: SessionController): void {
 					if (k().item(item.id)?.state === 'open')
 						k().answerItem(item.id, answer, {channel: 'terminal'});
 				} else {
-					const deadline =
-						Date.now() +
-						Math.min(Math.max(p.timeoutSec ?? 1800, 1), 7200) * 1000;
+					const timeoutSec = Math.min(Math.max(p.timeoutSec ?? 1800, 1), 7200);
+					const deadline = Date.now() + timeoutSec * 1000;
+					// Answered from an inbox, or by the human replying in this session
+					// (the input handler answers it, D39).
 					while (k().item(item.id)?.state === 'open') {
-						if (signal?.aborted || Date.now() > deadline)
+						if (signal?.aborted)
 							return ok(
-								`no answer yet; ${item.id} stays in the inbox and the answer will arrive as a message`,
+								`aborted; ${item.id} stays in the inbox and the answer will arrive as a message`,
 							);
+						if (Date.now() > deadline) {
+							// The agent must not have to remember this (D39): without it,
+							// messages from other sessions would wake it before the human.
+							ctl.declaredWaiting = true;
+							return ok(
+								`no answer after ${timeoutSec} s; ${item.id} stays in the human's inbox. This session is now declared waiting-for-human: END YOUR TURN NOW, without further work. The human's answer will wake you (a message, origin human).`,
+								{itemId: item.id, timedOut: true},
+							);
+						}
 						await sleep(WAIT_POLL_MS, signal);
 					}
 				}
 				const done = k().item(item.id)!;
-				const ids = k()
-					.pendingFor(self())
-					.filter((m) => m.itemId === item.id)
-					.map((m) => m.id);
-				k().markDelivered(self(), ids);
+				if (done.state === 'withdrawn')
+					return ok(`${item.id} was withdrawn`, {itemId: item.id});
+				// Answered: an earlier timeout's declaration no longer holds.
+				ctl.declaredWaiting = false;
+				// The answer is in this tool result, so it is delivered; unless the run
+				// was aborted, when pi may drop the result: then the message stays
+				// pending and is delivered in the next run.
+				if (!signal?.aborted) {
+					const ids = k()
+						.pendingFor(self())
+						.filter((m) => m.itemId === item.id)
+						.map((m) => m.id);
+					k().markDelivered(self(), ids);
+				}
+				const where =
+					done.answerChannel === SESSION_ANSWER_CHANNEL
+						? 'replying in this session'
+						: `on ${done.answerChannel}`;
 				return ok(
-					`the human answered ${item.id} (origin human, on ${done.answerChannel}):\n${done.answer}`,
-					{itemId: item.id},
+					`the human answered ${item.id} (origin human, ${where}):\n${done.answer}`,
+					{itemId: item.id, channel: done.answerChannel},
 				);
 			} finally {
+				ctl.waitingItem = null;
 				ctl.setToolState(null);
 			}
+		},
+	});
+
+	tool({
+		name: 'human_withdraw',
+		label: 'Human Withdraw',
+		description:
+			"Withdraw an inbox item (h_...) you raised that no longer needs the human: you found the answer, or the question no longer stands. It leaves the human's inbox. Only items this session raised.",
+		promptSnippet: 'Withdraw an inbox item you raised (shipmates)',
+		parameters: Type.Object({itemId: Type.String()}),
+		run(p) {
+			const item = k().withdrawItem(self(), p.itemId);
+			if (item.state === 'answered')
+				return ok(
+					`${p.itemId} was already answered (on ${item.answerChannel}):\n${item.answer}`,
+				);
+			return ok(`${p.itemId} withdrawn`);
 		},
 	});
 

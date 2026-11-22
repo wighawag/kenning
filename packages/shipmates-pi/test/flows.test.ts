@@ -273,9 +273,9 @@ describe('a running lane', () => {
 });
 
 describe('the human inbox', () => {
-	it('a question for the human waits in the inbox; the answer wakes the lane as human input', async () => {
+	it('a non-blocking question for the human waits in the inbox; the answer wakes the lane as human input', async () => {
 		await missiv.prompt(
-			'DO human_ask {"question":"Publish delegated-identity 0.1.0? npm needs your 2FA.","options":["done","not now"]}',
+			'DO human_ask {"question":"Publish delegated-identity 0.1.0? npm needs your 2FA.","options":["done","not now"],"blocking":false}',
 		);
 		const [item] = k.inbox();
 		expect(item.question).toContain('delegated-identity');

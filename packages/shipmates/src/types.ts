@@ -68,6 +68,12 @@ export interface Question {
 	createdAt: number;
 }
 
+/**
+ * The `answerChannel` of an item the human answered by replying in the asking
+ * session's own conversation rather than in an inbox (D39).
+ */
+export const SESSION_ANSWER_CHANNEL = 'session';
+
 export interface AttentionItem {
 	id: string;
 	session: string;
@@ -77,8 +83,15 @@ export interface AttentionItem {
 	onBehalfOf: string[];
 	state: 'open' | 'answered' | 'withdrawn';
 	answer: string | null;
+	/**
+	 * Where the human answered: `terminal` (a TUI dialog or `/shipmates inbox`),
+	 * `cli`, a host's own channel (`web`, `telegram`), or `session` when the
+	 * human replied in the asking session's own conversation (D39).
+	 */
 	answerChannel: string | null;
 	createdAt: number;
+	/** When it was answered or withdrawn; null while open. */
+	finishedAt: number | null;
 }
 
 /** How a session came to be owned (D23): through a host, or the terminal default (D19). */

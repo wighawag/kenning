@@ -1,4 +1,5 @@
 import {describe, expect, it} from 'vitest';
+import {SESSION_ANSWER_CHANNEL} from '../src/index.js';
 import {A, B, world} from './helpers.js';
 
 function lanes() {
@@ -120,6 +121,104 @@ describe('the human inbox', () => {
 		expect(() =>
 			push.k.humanAsk({from: A, question: 'x', onBehalfOf: ['q_nope']}),
 		).toThrow(/q_nope/);
+	});
+
+	it("a reply in the asking session closes its open items, with no second copy of the human's words (D39)", () => {
+		const {w, push, missiv} = lanes();
+		const one = push.k.humanAsk({from: A, question: 'Branch?'});
+		const two = push.k.humanAsk({from: A, question: 'Version?'});
+		const other = missiv.k.humanAsk({from: B, question: 'License?'});
+		const kept = push.k.humanAsk({from: A, question: 'Waited on'});
+		w.advance(10);
+		const closed = push.k.answerOpenItemsOf(A, 'main, 0.2.0', {
+			channel: SESSION_ANSWER_CHANNEL,
+			deliver: false,
+			except: [kept.id],
+		});
+		expect(closed.map((i) => i.id)).toEqual([one.id, two.id]);
+		for (const i of closed)
+			expect(i).toMatchObject({
+				state: 'answered',
+				answer: 'main, 0.2.0',
+				answerChannel: 'session',
+				finishedAt: push.k.now(),
+			});
+		expect(push.k.pendingFor(A)).toEqual([]);
+		expect(push.k.inbox().map((i) => i.id)).toEqual([other.id, kept.id]);
+		// An item closed this way can still be relayed by an orchestrator.
+		expect(push.k.relayFromHuman(A, {itemId: one.id})).toMatchObject({
+			text: 'main, 0.2.0',
+			channel: 'session',
+		});
+		expect(
+			push.k.answerItem(kept.id, 'x', {channel: 'session', deliver: false}),
+		).toBeNull();
+		expect(push.k.pendingFor(A)).toEqual([]);
+	});
+
+	it('with notice, the session is told which items the reply closed, once', () => {
+		const {push} = lanes();
+		const one = push.k.humanAsk({from: A, question: 'Branch?'});
+		const two = push.k.humanAsk({from: A, question: 'Version?'});
+		push.k.answerOpenItemsOf(A, 'main', {
+			channel: 'session',
+			deliver: false,
+			notice: true,
+		});
+		const pending = push.k.pendingFor(A);
+		expect(pending).toHaveLength(1);
+		expect(pending[0]).toMatchObject({kind: 'notice', origin: 'agent'});
+		expect(pending[0].text).toContain(one.id);
+		expect(pending[0].text).toContain(two.id);
+		// Nothing open: no write, no notice.
+		expect(
+			push.k.answerOpenItemsOf(A, 'again', {channel: 'session', notice: true}),
+		).toEqual([]);
+		expect(push.k.pendingFor(A)).toHaveLength(1);
+	});
+
+	it('an item answered through one channel cannot be answered again through another', () => {
+		const {push, missiv} = lanes();
+		const item = push.k.humanAsk({from: A, question: 'Branch?'});
+		push.k.answerItem(item.id, 'main', {channel: 'session', deliver: false});
+		expect(() =>
+			missiv.k.answerItem(item.id, 'dev', {channel: 'telegram'}),
+		).toThrow(expect.objectContaining({code: 'answered'}));
+		expect(push.k.item(item.id)).toMatchObject({
+			answer: 'main',
+			answerChannel: 'session',
+		});
+		expect(push.k.pendingFor(A)).toEqual([]);
+	});
+
+	it('only the session that raised an item can withdraw it', () => {
+		const {push, missiv} = lanes();
+		const item = push.k.humanAsk({from: A, question: 'Branch?'});
+		expect(() => missiv.k.withdrawItem(B, item.id)).toThrow(/not by you/);
+		expect(push.k.item(item.id)!.state).toBe('open');
+		expect(push.k.withdrawItem(A, item.id).state).toBe('withdrawn');
+		expect(() => push.k.withdrawItem(A, 'h_nope')).toThrow(/no item/);
+	});
+
+	it('a host can read which items closed since it last looked, and how', () => {
+		const {w, push} = lanes();
+		const a = push.k.humanAsk({from: A, question: 'a'});
+		const b = push.k.humanAsk({from: A, question: 'b'});
+		push.k.humanAsk({from: A, question: 'c'});
+		w.advance(10);
+		const since = push.k.now();
+		push.k.answerItem(a.id, 'yes', {channel: 'web'});
+		w.advance(10);
+		push.k.withdrawItem(A, b.id);
+		expect(
+			push.k
+				.itemsFinishedSince(since)
+				.map((i) => [i.id, i.state, i.answerChannel]),
+		).toEqual([
+			[a.id, 'answered', 'web'],
+			[b.id, 'withdrawn', null],
+		]);
+		expect(push.k.itemsFinishedSince(push.k.now() + 1)).toEqual([]);
 	});
 });
 

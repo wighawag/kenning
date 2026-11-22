@@ -7,7 +7,16 @@
 // pool does before any extension loads. Run with node (type stripping); stops
 // on SIGTERM. Prints `{"type":"ready","sessionFile":...}` once the first
 // prompt settled, a JSON line like the rpc events the harness reads.
+//
+// It then reads JSON lines on stdin, each a send as wherever's server makes
+// one: `{"type":"send","id","text","channel"?,"source"?,"streamingBehavior"?}`.
+// With `channel`, it first emits the `shipmates:human-input` mark on the
+// session's bus (a human's send, D22); without, the send is unmarked (an agent
+// or a schedule). It prints `{"type":"preflight","id","disposition"}` as pi
+// decides what to do with it, and `{"type":"sent","id","error"?}` once the
+// awaited prompt() settles.
 import path from 'node:path';
+import readline from 'node:readline';
 import {
 	createAgentSession,
 	DefaultResourceLoader,
@@ -24,6 +33,7 @@ const BRAIN = path.resolve(here, 'brain.ts');
 if (process.env.PRINT_HOST_WHEREVER === '1')
 	(globalThis as any)[Symbol.for('wherever-dev.server-process')] = true;
 
+let events: {emit(name: string, data: unknown): void} | null = null;
 const cwd = process.cwd();
 const agentDir = process.env.PI_CODING_AGENT_DIR!;
 const sessionDir = process.env.SHIPMATES_TEST_SESSION_DIR!;
@@ -37,6 +47,15 @@ const resourceLoader = new DefaultResourceLoader({
 	noPromptTemplates: true,
 	noContextFiles: true,
 	additionalExtensionPaths: [SHIPMATES_PI, BRAIN],
+	// The session's own bus, as wherever's human-input marker captures it.
+	extensionFactories: [
+		{
+			name: 'test-human-input',
+			factory: (pi) => {
+				events = pi.events;
+			},
+		},
+	],
 });
 await resourceLoader.reload();
 
@@ -70,6 +89,34 @@ console.log(
 		sessionFile: session.sessionManager.getSessionFile(),
 	}),
 );
+
+const out = (o: object) => console.log(JSON.stringify(o));
+readline.createInterface({input: process.stdin}).on('line', (line) => {
+	let cmd: any;
+	try {
+		cmd = JSON.parse(line);
+	} catch {
+		return;
+	}
+	if (cmd.type !== 'send') return;
+	if (cmd.channel)
+		events?.emit('shipmates:human-input', {
+			text: cmd.text,
+			channel: cmd.channel,
+		});
+	session
+		.prompt(cmd.text, {
+			source: cmd.source ?? 'extension',
+			expandPromptTemplates: false,
+			streamingBehavior: cmd.streamingBehavior ?? 'steer',
+			preflightResult: (disposition) =>
+				out({type: 'preflight', id: cmd.id, disposition}),
+		})
+		.then(
+			() => out({type: 'sent', id: cmd.id}),
+			(e) => out({type: 'sent', id: cmd.id, error: String(e?.message ?? e)}),
+		);
+});
 
 // Teardown as wherever's shutdownAndDisposeAgentSession does it: abort, then
 // session_shutdown to the extensions (dispose() alone does not emit it), then

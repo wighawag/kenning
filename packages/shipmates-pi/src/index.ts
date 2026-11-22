@@ -39,8 +39,15 @@ export default function extension(pi: ExtensionAPI): void {
 	pi.events.on(HUMAN_INPUT_EVENT, (data) => ctl.onHumanMark(data));
 	pi.events.on(HUMAN_INPUT_END_EVENT, (data) => ctl.onHumanMarkEnd(data));
 	pi.on('input', (event) => {
-		ctl.onInput(event.text, event.source);
-		return {action: 'continue'};
+		// `handled`: the human's reply became a waiting human_ask's result (D39).
+		// pi runs input handlers before it queues a steer or follow-up, also
+		// while a tool runs, so nothing reaches pi's queues (measured, pi 1.4).
+		const handled = ctl.onInput(
+			event.text,
+			event.source,
+			!!event.images?.length,
+		);
+		return {action: handled ? 'handled' : 'continue'};
 	});
 
 	pi.on('before_agent_start', (event) => {

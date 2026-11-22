@@ -1,5 +1,6 @@
 import {
 	planDelivery,
+	SESSION_ANSWER_CHANNEL,
 	type HumanInputMark,
 	type Shipmates,
 	type Message,
@@ -76,6 +77,12 @@ export class SessionController {
 	declaredWaiting = false;
 	/** Inside session_wait or a blocking human_ask: the tool does its own reporting. */
 	toolState: SessionState | null = null;
+	/**
+	 * The item a blocking human_ask of this session is waiting on (D39), and
+	 * whether it waits in a TUI dialog (the human answers there) or by polling
+	 * the inbox (a human reply in this session then answers it).
+	 */
+	waitingItem: {id: string; dialog: boolean} | null = null;
 	private humanMarks: (HumanInputMark & {at: number})[] = [];
 	/** When the current run started (shipmates' clock), for stop requests (D30). */
 	private runStartedAt = 0;
@@ -308,23 +315,62 @@ export class SessionController {
 		if (i >= 0) this.humanMarks.splice(i, 1);
 	}
 
-	/** ADR 0003: TUI typing, or an input a host marked as human just before sending it. */
-	onInput(text: string, source: string): void {
-		if (!this.active) return;
+	/**
+	 * ADR 0003: TUI typing, or an input a host marked as human just before
+	 * sending it. A human turn also answers this session's open inbox items
+	 * (D39). Returns true when the input was consumed as the answer a blocking
+	 * human_ask is waiting for, so pi must not also queue it.
+	 */
+	onInput(text: string, source: string, hasImages = false): boolean {
+		if (!this.active) return false;
+		let channel: string | null = null;
 		if (source === 'interactive') {
-			if (this.typedAtTerminal())
-				this.shipmates!.recordHumanTurn(this.file!, {
-					text,
-					channel: 'terminal',
-				});
-			return;
+			if (this.typedAtTerminal()) channel = 'terminal';
+		} else if (source === 'extension') {
+			this.dropExpiredMarks();
+			const i = this.humanMarks.findIndex((m) => m.text === text);
+			if (i >= 0) channel = this.humanMarks.splice(i, 1)[0].channel;
 		}
-		if (source !== 'extension') return;
-		this.dropExpiredMarks();
-		const i = this.humanMarks.findIndex((m) => m.text === text);
-		if (i < 0) return;
-		const [mark] = this.humanMarks.splice(i, 1);
-		this.shipmates!.recordHumanTurn(this.file!, {text, channel: mark.channel});
+		if (!channel) return false;
+		this.shipmates!.recordHumanTurn(this.file!, {text, channel});
+		// pi expands `/skill:` and prompt templates after the input handlers: a
+		// command is not an answer to anything (extension commands never get here).
+		if (text.trimStart().startsWith('/')) return false;
+		return this.answerFromSession(text, hasImages);
+	}
+
+	/**
+	 * D39: the human replied in this session, so every item it raised and that
+	 * is still open is answered with their words, on channel `session`. When a
+	 * blocking human_ask polls for one of them, that one is answered with a
+	 * message (the tool returns it as its result and marks it delivered, and if
+	 * the tool is gone the message is delivered like any answer) and the input
+	 * is consumed. Every other item closes with no message: the human's words
+	 * are in this session's turn already; one notice names the items they
+	 * closed, so the agent knows which questions are settled. An input with images is not consumed
+	 * (the tool result cannot carry them), so it also joins the turn as usual.
+	 */
+	private answerFromSession(text: string, hasImages: boolean): boolean {
+		const k = this.shipmates!;
+		const w = this.waitingItem;
+		let consumed = false;
+		if (w && !w.dialog && k.item(w.id)?.state === 'open') {
+			try {
+				k.answerItem(w.id, text, {
+					channel: SESSION_ANSWER_CHANNEL,
+					deliver: !hasImages,
+				});
+				consumed = !hasImages;
+			} catch {} // answered elsewhere at the same moment: the tool reports that
+		}
+		k.answerOpenItemsOf(this.file!, text, {
+			channel: SESSION_ANSWER_CHANNEL,
+			deliver: false,
+			notice: true,
+			// A TUI dialog is answered in the dialog, not by typing elsewhere.
+			except: w?.dialog ? [w.id] : [],
+		});
+		return consumed;
 	}
 
 	/**

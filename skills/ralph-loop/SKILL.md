@@ -47,13 +47,14 @@ These always go to the human, whatever the approval policy: deleting a branch or
 3. **End your turn idle.** Every message wakes you. Stay out of `waiting-for-human` while workers run: that state holds their reports until the human next writes to you.
 4. **On every wake**, fetch and re-read the plan first, then act on each message:
    - `DONE <step>` from a worker: start its review (below), or with review off go to the gate.
+   - the human's own reply in your chat: it answers ALL your open `human_ask` items at once, and a `[shipmates]` notice lists the items it closed. Act on it for each of them as for an inbox answer (relay with `relayItem`), and re-ask what the reply did not actually answer.
    - a `session_ask` from a worker: answer what the plan or the human's earlier answers settle (`session_answer`); merge the rest into one `human_ask` with `onBehalfOf` set to the question ids, and when the human answers, relay it to the worker with origin `human-relayed` and `relayItem`, then `session_answer` its questions.
-   - `BLOCKED <step>: <why>`: raise it to the human with a non-blocking `human_ask` carrying the worker's reason, and keep that lane idle until they answer.
+   - `BLOCKED <step>: <why>`: raise it to the human with a `human_ask` with `blocking: false` (the other lanes are your independent work) carrying the worker's reason, and keep that lane idle until they answer.
    - a reviewer's verdict: `ISSUES` within the fix rounds goes back to the worker (`session_tell`, the issues verbatim), and its next `DONE` is reviewed again; otherwise go to the gate.
    - `PUSHED <step>` from a worker: the step is complete. Check the plan at its ref shows it ticked, count it, and spawn the next step while the budget allows.
 5. **The gate.** Decide by the approval policy and the guardrails:
    - **Go ahead**: `session_tell` the worker "push the listed refs now", with origin `human-relayed` and `relayQuote` set to the sentence of the brief that grants the approval. Only the human's own words satisfy a push gate, and shipmates refuses words the human never typed. shipmates searches the human's last 20 messages in your session; when the brief is older, ask the human to restate the approval.
-   - **Ask the human**: one non-blocking `human_ask` with options `Approve` and `Hold`, whose question names the step, the pushes, the review verdict and the reason you ask. On `Approve`, relay it to the worker with origin `human-relayed` and `relayItem`; on `Hold` or any other answer, pass the human's words to the worker and follow them.
+   - **Ask the human**: one `human_ask` with `blocking: false` with options `Approve` and `Hold`, whose question names the step, the pushes, the review verdict and the reason you ask. On `Approve`, relay it to the worker with origin `human-relayed` and `relayItem`; on `Hold` or any other answer, pass the human's words to the worker and follow them.
 6. **Keep the status line current**: the step, its phase (building, review round N, at the gate, pushing) and steps done out of the budget.
 7. **Stop** when the budget is spent, the plan has no next step, or every lane waits on the human. End with a report in your chat: the steps completed with their pushes, what is open and on whom, and what comes next. If `assistant_notify` is available, send it the one-line summary.
 

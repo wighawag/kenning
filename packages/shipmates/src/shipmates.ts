@@ -206,6 +206,7 @@ type ItemRow = {
 	answer: string | null;
 	answer_channel: string | null;
 	created_at: number;
+	finished_at: number | null;
 };
 
 function toItem(r: ItemRow): AttentionItem {
@@ -220,6 +221,7 @@ function toItem(r: ItemRow): AttentionItem {
 		answer: r.answer,
 		answerChannel: r.answer_channel,
 		createdAt: r.created_at,
+		finishedAt: r.finished_at,
 	};
 }
 
@@ -881,45 +883,139 @@ export class Shipmates {
 
 	/**
 	 * The human answered an item. Callers must only call this for a real human act
-	 * (a slash command, the CLI at a terminal, a host's authenticated UI): ADR 0003.
+	 * (a slash command, the CLI at a terminal, a host's authenticated UI, a human
+	 * turn in the asking session): ADR 0003.
+	 *
+	 * The answer goes to the asking session as a message of origin `human`, unless
+	 * `deliver` is false: the human said it in that session's own turn, so their
+	 * words are already in its transcript and a second copy would repeat them (D39).
 	 */
-	answerItem(itemId: string, text: string, opts: {channel: string}): Message {
-		const item = this.item(itemId);
-		if (!item) throw new ShipmatesError(`no item ${itemId}`, 'not-found');
-		if (item.state !== 'open')
-			throw new ShipmatesError(
-				`item ${itemId} is already ${item.state}`,
-				item.state,
-			);
+	answerItem(
+		itemId: string,
+		text: string,
+		opts: {channel: string; deliver?: true},
+	): Message;
+	answerItem(
+		itemId: string,
+		text: string,
+		opts: {channel: string; deliver: boolean},
+	): Message | null;
+	answerItem(
+		itemId: string,
+		text: string,
+		opts: {channel: string; deliver?: boolean},
+	): Message | null {
+		// Checked inside the write: the session's input handler and another
+		// channel (the CLI, a host) may answer the same item at the same moment,
+		// and only one of them may win (D39).
+		const id = this.tx(() => {
+			const item = this.item(itemId);
+			if (!item) throw new ShipmatesError(`no item ${itemId}`, 'not-found');
+			if (item.state !== 'open')
+				throw new ShipmatesError(
+					`item ${itemId} is already ${item.state}`,
+					item.state,
+				);
+			return this.closeItem(item, text, opts);
+		});
+		return id ? this.message(id)! : null;
+	}
+
+	/**
+	 * The human replied in the session that raised these items (D39): every item
+	 * of `sessionFile` still open, except `except`, is answered with their words
+	 * on `opts.channel` (by convention `session`). Returns the items it closed.
+	 *
+	 * With `notice`, the session also gets one `notice` message (origin agent,
+	 * from shipmates) naming the items the reply closed: the human's words are in
+	 * its turn, but nothing else would tell the agent which questions they
+	 * closed, and it may still be waiting on one of them.
+	 */
+	answerOpenItemsOf(
+		sessionFile: string,
+		text: string,
+		opts: {
+			channel: string;
+			deliver?: boolean;
+			except?: string[];
+			notice?: boolean;
+		},
+	): AttentionItem[] {
+		const skip = new Set(opts.except ?? []);
+		const open = () =>
+			(
+				this.db
+					.prepare(
+						`SELECT * FROM item WHERE session_file = ? AND state = 'open' ORDER BY created_at`,
+					)
+					.all(sessionFile) as ItemRow[]
+			).filter((r) => !skip.has(r.id));
+		// Read first: the write lock only when there is something to close
+		// (every human input calls this; most sessions have no open item).
+		if (!open().length) return [];
+		return this.tx(() => {
+			const rows = open();
+			for (const r of rows) this.closeItem(toItem(r), text, opts);
+			if (opts.notice && rows.length)
+				this.insertMessage({
+					from: null,
+					fromLabel: 'shipmates',
+					to: {kind: 'session', target: sessionFile},
+					kind: 'notice',
+					text: `The human's reply in this session closed ${rows.length === 1 ? 'your inbox item' : `${rows.length} of your inbox items`} (answered with their words, channel ${opts.channel}): ${rows.map((r) => `${r.id} "${r.question.slice(0, 120)}"`).join('; ')}. If it did not answer one of them, ask again.`,
+					origin: 'agent',
+				});
+			return rows.map((r) => r.id);
+		}).map((id) => this.item(id)!);
+	}
+
+	/** Inside a write: mark an open item answered, and send the answer unless told not to. */
+	private closeItem(
+		item: AttentionItem,
+		text: string,
+		opts: {channel: string; deliver?: boolean},
+	): string | null {
 		const t = this.now();
+		const r = this.db
+			.prepare(
+				`UPDATE item SET state = 'answered', answer = ?, answer_channel = ?, finished_at = ? WHERE id = ? AND state = 'open'`,
+			)
+			.run(text, opts.channel, t, item.id);
+		if (Number(r.changes) !== 1)
+			throw new ShipmatesError(`item ${item.id} is no longer open`, 'answered');
+		if (opts.deliver === false) return null;
 		const relay: Relay = {
 			text,
 			channel: opts.channel,
 			session: null,
-			itemId,
+			itemId: item.id,
 			at: t,
 		};
-		const id = this.tx(() => {
-			this.db
-				.prepare(
-					`UPDATE item SET state = 'answered', answer = ?, answer_channel = ?, finished_at = ? WHERE id = ?`,
-				)
-				.run(text, opts.channel, t, itemId);
-			return this.insertMessage({
-				from: null,
-				fromLabel: 'human',
-				to: {kind: 'session', target: item.session},
-				kind: 'answer',
-				text,
-				origin: 'human',
-				relay,
-				itemId,
-			});
+		return this.insertMessage({
+			from: null,
+			fromLabel: 'human',
+			to: {kind: 'session', target: item.session},
+			kind: 'answer',
+			text,
+			origin: 'human',
+			relay,
+			itemId: item.id,
 		});
-		return this.message(id)!;
 	}
 
-	withdrawItem(from: string, itemId: string): void {
+	/**
+	 * Withdraw an item this session raised and that is still open. Refused for
+	 * another session's item: only the asker knows the question no longer stands.
+	 * Returns the item as it now is (unchanged when it was already answered).
+	 */
+	withdrawItem(from: string, itemId: string): AttentionItem {
+		const item = this.item(itemId);
+		if (!item) throw new ShipmatesError(`no item ${itemId}`, 'not-found');
+		if (item.session !== from)
+			throw new ShipmatesError(
+				`item ${itemId} was raised by ${this.labelOf(item.session)}, not by you`,
+				'not-yours',
+			);
 		this.tx(() => {
 			this.db
 				.prepare(
@@ -927,6 +1023,21 @@ export class Shipmates {
 				)
 				.run(this.now(), itemId, from);
 		});
+		return this.item(itemId)!;
+	}
+
+	/**
+	 * Items that closed (answered or withdrawn) at or after `since`, oldest
+	 * first: what a host reads to update its own copy of an item it pushed to
+	 * the human (a Telegram message that must stop looking open, D39).
+	 */
+	itemsFinishedSince(since: number): AttentionItem[] {
+		const rows = this.db
+			.prepare(
+				`SELECT * FROM item WHERE state != 'open' AND finished_at >= ? ORDER BY finished_at, rowid`,
+			)
+			.all(since) as ItemRow[];
+		return rows.map(toItem);
 	}
 
 	/** The human's answers to this session's items, newest first. */
