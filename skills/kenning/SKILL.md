@@ -14,7 +14,7 @@ Live pi sessions on this machine can see, message and ask each other, and the hu
 2. **Read before you send.** `session_list`, then `session_read` the session you are about to address. Its status, open questions and recent text often answer you already, and they tell you whether your message is still true.
 3. **Tell or ask.** `session_tell` informs; `session_ask` expects an answer and stays open until `session_answer` closes it. Point at refs (branch, commit, published version, plan section) instead of copying content. A message that turned out wrong is fixed with `session_supersede` while it is undelivered.
 4. **Wait when the answer gates your next step.** `session_wait` returns on the answer, on the target settling without one, or when someone asks you something (answer it, then wait again).
-5. **Escalate only real decisions.** What only the human can decide goes through `human_ask` (blocking when you cannot continue without it). Ending a turn with a question in prose leaves it unseen; ending it waiting for the human means `session_register` with state `waiting-for-human`, so messages wait for their next turn instead of waking you.
+5. **Escalate only real decisions.** What only the human can decide goes through `human_ask` (blocking when you cannot continue without it). Ending a turn with a question in prose leaves it unseen; ending it waiting for the human means `session_register` with state `waiting-for-human`, so messages from other sessions wait for their next turn instead of waking you (the human's answer to your `human_ask` still wakes you).
 
 ## Provenance
 

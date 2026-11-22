@@ -22,19 +22,28 @@ export interface SessionView {
  * - `at-turn-end`: returned from `turn_end` (urgent, or after a dialog);
  * - `wake`: start a turn now (`sendMessage` with `triggerTurn`);
  * - `hold-for-human`: attached to the human's next run by `before_agent_start`.
+ *
+ * `fromHuman`: a pending message has origin `human` (an inbox answer, the
+ * human's `kenning tell`), which only a human act can produce (ADR 0003). A
+ * session that declared `waiting-for-human` is waiting for exactly that, so it
+ * wakes for it: holding it for "the human's next turn" meant an answer given
+ * from the inbox (or a host such as wherever) sat there until the human also
+ * typed into the session, which they had no reason to do. Still held while the
+ * human types into the session (it joins that run) or with waking off.
  */
 export type DeliveryPlan =
 	'at-settle' | 'at-turn-end' | 'wake' | 'hold-for-human';
 
 export function planDelivery(
 	view: SessionView,
-	message: {urgent: boolean},
+	message: {urgent: boolean; fromHuman?: boolean},
 ): DeliveryPlan {
 	if (view.phase === 'running') {
 		if (view.uiPrompt) return 'at-turn-end';
 		return message.urgent ? 'at-turn-end' : 'at-settle';
 	}
-	if (view.declared === 'waiting-for-human' || view.editorBusy || !view.wake)
+	if (view.editorBusy || !view.wake) return 'hold-for-human';
+	if (view.declared === 'waiting-for-human' && !message.fromHuman)
 		return 'hold-for-human';
 	return 'wake';
 }

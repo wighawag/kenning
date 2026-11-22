@@ -30,6 +30,26 @@ describe('planDelivery', () => {
 		).toBe('hold-for-human');
 	});
 
+	it('a session waiting for the human wakes for the human (an inbox answer), and only for them', () => {
+		const waiting = {...settled, declared: 'waiting-for-human' as const};
+		expect(planDelivery(waiting, {urgent: false, fromHuman: true})).toBe(
+			'wake',
+		);
+		expect(planDelivery(waiting, {urgent: true, fromHuman: false})).toBe(
+			'hold-for-human',
+		);
+		// The human typing into the session, or waking off, still holds it.
+		expect(
+			planDelivery(
+				{...waiting, editorBusy: true},
+				{urgent: false, fromHuman: true},
+			),
+		).toBe('hold-for-human');
+		expect(
+			planDelivery({...waiting, wake: false}, {urgent: false, fromHuman: true}),
+		).toBe('hold-for-human');
+	});
+
 	it('never wakes a session while the human is typing in it, or when waking is off', () => {
 		expect(planDelivery({...settled, editorBusy: true}, {urgent: false})).toBe(
 			'hold-for-human',

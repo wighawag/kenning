@@ -85,6 +85,42 @@ describe("a print-mode session in wherever's server (D36)", () => {
 		expect(k.pendingFor(markedFile)).toEqual([]);
 	});
 
+	it("waiting for the human, it holds an agent's message and wakes for the human's inbox answer", async () => {
+		k.send({
+			from: plainFile,
+			to: 'w/marked',
+			text: 'DO session_register {"state":"waiting-for-human","status":"waiting on the human"}',
+		});
+		await eventually(
+			() => k.presence(markedFile)?.state,
+			(s) => s === 'waiting-for-human',
+		);
+		expect(k.presence(markedFile)!.state).toBe('waiting-for-human');
+		const item = k.humanAsk({from: markedFile, question: 'Which branch?'});
+
+		// Another agent's message waits for the human (D3).
+		k.send({
+			from: plainFile,
+			to: 'w/marked',
+			text: 'DO session_register {"status":"agent message ran"}',
+		});
+		await quiet(1000); // ten polls
+		expect(k.presence(markedFile)!.status).toBe('waiting on the human');
+		expect(k.pendingFor(markedFile)).toHaveLength(1);
+
+		// The human answers from the inbox (as wherever's web or Telegram does):
+		// that is what it waits for, so it wakes, with both messages, in order.
+		k.answerItem(item.id, 'DO session_register {"status":"answered: main"}', {
+			channel: 'web',
+		});
+		const status = await eventually(
+			() => k.presence(markedFile)?.status,
+			(s) => s === 'answered: main',
+		);
+		expect(status).toBe('answered: main');
+		expect(k.pendingFor(markedFile)).toEqual([]);
+	});
+
 	it('without the marker (a print-mode session that is not wherever) it never wakes itself (D29)', async () => {
 		k.send({
 			from: markedFile,

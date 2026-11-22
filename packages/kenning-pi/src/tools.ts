@@ -199,7 +199,7 @@ export function registerTools(pi: ExtensionAPI, ctl: SessionController): void {
 			state: Type.Optional(
 				Type.Union([Type.Literal('waiting-for-human'), Type.Literal('idle')], {
 					description:
-						'"waiting-for-human" when you end this turn needing the human: messages then wait for their next turn instead of waking you.',
+						'"waiting-for-human" when you end this turn needing the human: messages from other sessions then wait for their next turn instead of waking you; the human\'s own answer (an inbox answer) still wakes you.',
 				}),
 			),
 		}),

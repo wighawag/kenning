@@ -361,8 +361,10 @@ export class SessionController {
 				return;
 			if (this.phase !== 'settled' || !this.ctx.isIdle()) return;
 			const since = this.abortedAt ?? -Infinity;
-			const pending = this.kenning!.pendingFor(this.file!);
-			if (!pending.some((m) => m.createdAt > since)) return;
+			const pending = this.kenning!.pendingFor(this.file!).filter(
+				(m) => m.createdAt > since,
+			);
+			if (!pending.length) return;
 			const presence = this.kenning!.presence(this.file!);
 			const plan = planDelivery(
 				{
@@ -372,7 +374,10 @@ export class SessionController {
 					editorBusy: this.editorBusy(),
 					wake: presence?.wake ?? true,
 				},
-				{urgent: pending.some((m) => m.urgent)},
+				{
+					urgent: pending.some((m) => m.urgent),
+					fromHuman: pending.some((m) => m.origin === 'human'),
+				},
 			);
 			if (plan === 'wake') this.wake();
 		} catch (e) {
