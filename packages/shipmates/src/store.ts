@@ -164,6 +164,21 @@ CREATE TABLE stop_request(
 );
 CREATE INDEX stop_open ON stop_request(session_file, handled_at);
 `,
+	// 3: what a session chose for itself, kept per transcript file (D40).
+	`
+-- presence.wake is no longer read: a presence row is deleted when its process
+-- unregisters (a host unloading an idle session, a quit before a resume), and
+-- the choice went with it. A row exists only while a setting differs from the
+-- default; it is pruned like ownership, once the transcript is gone (D40).
+CREATE TABLE session_setting(
+  session_file TEXT PRIMARY KEY,
+  wake INTEGER NOT NULL DEFAULT 1,            -- /shipmates wake off
+  declared_waiting INTEGER NOT NULL DEFAULT 0, -- declared waiting-for-human, until its next run
+  updated_at INTEGER NOT NULL
+);
+INSERT INTO session_setting(session_file, wake, updated_at)
+  SELECT session_file, 0, updated_at FROM presence WHERE wake = 0;
+`,
 ];
 
 export function defaultStateDir(): string {

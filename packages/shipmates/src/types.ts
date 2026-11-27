@@ -17,12 +17,29 @@ export interface Presence {
 	waitingOn: string | null;
 	/** Whether a message may start a turn here (`/shipmates wake off` clears it). */
 	wake: boolean;
+	/**
+	 * It declared `waiting-for-human` (ADR 0006) and has not run since. Like
+	 * `wake`, kept per transcript file across an unload or a resume (D40).
+	 */
+	declaredWaiting: boolean;
 	/** False once the process that registered it is gone. */
 	live: boolean;
 	pid: number;
 	updatedAt: number;
 	/** Last time it became idle or waiting for the human. */
 	settledAt: number | null;
+}
+
+/**
+ * What a session chose for itself, kept per transcript file whether or not it
+ * is live (D40): `/shipmates wake off`, and a declared `waiting-for-human`
+ * with no run since. `updatedAt` is null for a session that set nothing.
+ */
+export interface SessionSetting {
+	sessionFile: string;
+	wake: boolean;
+	declaredWaiting: boolean;
+	updatedAt: number | null;
 }
 
 /** The human words a human-relayed message carries, verbatim, and where they were said. */

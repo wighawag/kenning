@@ -173,6 +173,26 @@ describe('wake candidates (D29)', () => {
 		expect(k.wakeCandidates(A).map((o) => o.session)).toEqual([B]);
 		expect(k.wakeCandidates(B)).toEqual([]);
 	});
+
+	it("follow the child's own settings: not with wake off; waiting for the human, only for the human (D40)", () => {
+		const w = world();
+		const {k} = w.open(1);
+		k.recordOwnership({session: B, owner: A, folder: '/r', via: 'headless'});
+		k.recordOwnership({session: D, owner: A, folder: '/r', via: 'headless'});
+		k.claimRole(D, 'plan/d');
+		k.update(B, {wake: false});
+		k.update(D, {declaredWaiting: true});
+		k.send({from: A, to: B, text: 'for b'});
+		k.send({from: A, to: 'plan/d', text: 'for d, from an agent'});
+		expect(k.wakeCandidates(A)).toEqual([]);
+
+		const item = k.humanAsk({from: D, question: 'which?'});
+		k.answerItem(item.id, 'this one', {channel: 'web'});
+		expect(k.wakeCandidates(A).map((o) => o.session)).toEqual([D]);
+
+		k.update(B, {wake: true});
+		expect(k.wakeCandidates(A).map((o) => o.session)).toEqual([B, D]);
+	});
 });
 
 describe('stop requests', () => {

@@ -121,6 +121,145 @@ describe("a print-mode session in wherever's server (D36)", () => {
 		expect(k.pendingFor(markedFile)).toEqual([]);
 	});
 
+	// D40: wherever's pool unloads an idle session (session_shutdown, so
+	// shipmates unregisters) and loads it again on demand, in the same process.
+	const reload = async () => {
+		const id = marked.send({type: 'reload'});
+		await marked.waitFor((e) => e.type === 'reloaded' && e.id === id, {
+			what: 'marked reloaded',
+		});
+		await eventually(
+			() => k.presence(markedFile)?.live,
+			(l) => l === true,
+		);
+	};
+
+	it('a declared waiting-for-human survives an unload and a reload: agent messages stay held', async () => {
+		k.send({
+			from: plainFile,
+			to: 'w/marked',
+			text: 'DO session_register {"state":"waiting-for-human","status":"waiting before reload"}',
+		});
+		await eventually(
+			() => k.presence(markedFile)?.state,
+			(s) => s === 'waiting-for-human',
+		);
+		await reload();
+		expect(k.presence(markedFile)).toMatchObject({
+			state: 'waiting-for-human',
+			declaredWaiting: true,
+		});
+
+		k.send({
+			from: plainFile,
+			to: 'w/marked',
+			text: 'DO session_register {"status":"agent message ran"}',
+		});
+		await quiet(1000); // ten polls
+		// The status line went with the old presence; the message did not run.
+		expect(k.presence(markedFile)!.status).not.toBe('agent message ran');
+		expect(k.pendingFor(markedFile)).toHaveLength(1);
+
+		// The human's answer still wakes it (D37), and that run ends the declaration.
+		const item = k.humanAsk({from: markedFile, question: 'Go on?'});
+		k.answerItem(
+			item.id,
+			'DO session_register {"status":"answered after reload"}',
+			{
+				channel: 'web',
+			},
+		);
+		await eventually(
+			() => k.presence(markedFile),
+			(p) => p?.status === 'answered after reload' && p.state === 'idle',
+		);
+		expect(k.presence(markedFile)!.declaredWaiting).toBe(false);
+		await reload();
+		expect(k.presence(markedFile)!.state).toBe('idle');
+	});
+
+	it('wake off survives an unload and a reload', async () => {
+		// What `/shipmates wake off` writes.
+		k.update(markedFile, {wake: false});
+		await reload();
+		expect(k.presence(markedFile)!.wake).toBe(false);
+		k.send({
+			from: plainFile,
+			to: 'w/marked',
+			text: 'DO session_register {"status":"woken with wake on"}',
+		});
+		await quiet(1000);
+		expect(k.presence(markedFile)!.status).not.toBe('woken with wake on');
+		expect(k.pendingFor(markedFile)).toHaveLength(1);
+
+		k.update(markedFile, {wake: true});
+		const status = await eventually(
+			() => k.presence(markedFile)?.status,
+			(s) => s === 'woken with wake on',
+		);
+		expect(status).toBe('woken with wake on');
+	});
+
+	const askAndWait = async (question: string) => {
+		k.send({
+			from: plainFile,
+			to: 'w/marked',
+			text: `DO human_ask {"question":"${question}","timeoutSec":600}`,
+		});
+		const p = await eventually(
+			() => k.presence(markedFile),
+			(p) => p?.state === 'waiting-for-human' && !!p.waitingOn,
+		);
+		return p!.waitingOn!;
+	};
+
+	it('unloaded while a blocking human_ask waits, it comes back declared waiting-for-human', async () => {
+		const itemId = await askAndWait('Before the restart?');
+		await reload();
+		expect(k.item(itemId)!.state).toBe('open');
+		expect(k.presence(markedFile)).toMatchObject({
+			state: 'waiting-for-human',
+			declaredWaiting: true,
+		});
+		k.send({
+			from: plainFile,
+			to: 'w/marked',
+			text: 'DO session_register {"status":"agent message after restart"}',
+		});
+		await quiet(1000);
+		expect(k.pendingFor(markedFile)).toHaveLength(1);
+		k.answerItem(itemId, 'DO session_register {"status":"restart answered"}', {
+			channel: 'web',
+		});
+		await eventually(
+			() => k.presence(markedFile),
+			(p) => p?.status === 'restart answered' && p.state === 'idle',
+		);
+		expect(k.presence(markedFile)!.declaredWaiting).toBe(false);
+		expect(k.pendingFor(markedFile)).toEqual([]);
+	});
+
+	it("stopped by a stop request while a blocking human_ask waits, it is not declared waiting: the owner's next message wakes it", async () => {
+		const itemId = await askAndWait('Before the stop?');
+		k.requestStop(markedFile, {by: plainFile});
+		await eventually(
+			() => k.presence(markedFile)?.state,
+			(s) => s === 'idle',
+		);
+		expect(k.presence(markedFile)!.declaredWaiting).toBe(false);
+		k.send({
+			from: plainFile,
+			to: 'w/marked',
+			text: 'DO session_register {"status":"after the stop"}',
+		});
+		await eventually(
+			() => k.presence(markedFile)?.status,
+			(s) => s === 'after the stop',
+		);
+		expect(k.presence(markedFile)!.status).toBe('after the stop');
+		k.withdrawItem(markedFile, itemId);
+	});
+
 	it('without the marker (a print-mode session that is not wherever) it never wakes itself (D29)', async () => {
 		k.send({
 			from: markedFile,

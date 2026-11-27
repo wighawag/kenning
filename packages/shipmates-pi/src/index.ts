@@ -56,7 +56,7 @@ export default function extension(pi: ExtensionAPI): void {
 			event.messageType === 'custom' &&
 			event.message.customType === CUSTOM_TYPE
 		) {
-			ctl.declaredWaiting = false;
+			ctl.declareWaiting(false);
 			return;
 		}
 		const message = ctl.beforeAgentStart();

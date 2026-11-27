@@ -220,8 +220,8 @@ export function registerTools(pi: ExtensionAPI, ctl: SessionController): void {
 				);
 			}
 			k().update(self(), {status: p.status, refs: p.refs});
-			if (p.state === 'waiting-for-human') ctl.declaredWaiting = true;
-			if (p.state === 'idle') ctl.declaredWaiting = false;
+			if (p.state === 'waiting-for-human') ctl.declareWaiting(true);
+			if (p.state === 'idle') ctl.declareWaiting(false);
 			out.push(formatPresence(k().presence(self())!) + owners(self()));
 			return ok(out.join('\n'));
 		},
@@ -639,14 +639,16 @@ export function registerTools(pi: ExtensionAPI, ctl: SessionController): void {
 					// Answered from an inbox, or by the human replying in this session
 					// (the input handler answers it, D39).
 					while (k().item(item.id)?.state === 'open') {
-						if (signal?.aborted)
+						if (signal?.aborted) {
+							ctl.declareIfCutOff();
 							return ok(
 								`aborted; ${item.id} stays in the inbox and the answer will arrive as a message`,
 							);
+						}
 						if (Date.now() > deadline) {
 							// The agent must not have to remember this (D39): without it,
 							// messages from other sessions would wake it before the human.
-							ctl.declaredWaiting = true;
+							ctl.declareWaiting(true);
 							return ok(
 								`no answer after ${timeoutSec} s; ${item.id} stays in the human's inbox. This session is now declared waiting-for-human: END YOUR TURN NOW, without further work. The human's answer will wake you (a message, origin human).`,
 								{itemId: item.id, timedOut: true},
@@ -659,7 +661,7 @@ export function registerTools(pi: ExtensionAPI, ctl: SessionController): void {
 				if (done.state === 'withdrawn')
 					return ok(`${item.id} was withdrawn`, {itemId: item.id});
 				// Answered: an earlier timeout's declaration no longer holds.
-				ctl.declaredWaiting = false;
+				ctl.declareWaiting(false);
 				// The answer is in this tool result, so it is delivered; unless the run
 				// was aborted, when pi may drop the result: then the message stays
 				// pending and is delivered in the next run.

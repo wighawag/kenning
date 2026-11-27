@@ -73,7 +73,12 @@ export class SessionController {
 	private ctx: ExtensionContext | undefined;
 	private phase: 'running' | 'settled' = 'settled';
 	private uiPrompt = false;
-	/** session_register({state: 'waiting-for-human'}) during this run (ADR 0006). */
+	/**
+	 * session_register({state: 'waiting-for-human'}), or a human_ask timeout,
+	 * and no run since (ADR 0006). Kept in shipmates per transcript file, so an
+	 * unload and a reload (wherever's pool, a resume) still hold agent messages
+	 * for the human (D40). Change it with declareWaiting.
+	 */
 	declaredWaiting = false;
 	/** Inside session_wait or a blocking human_ask: the tool does its own reporting. */
 	toolState: SessionState | null = null;
@@ -92,6 +97,8 @@ export class SessionController {
 	 * would undo itself (D30). Cleared when a run starts.
 	 */
 	private abortedAt: number | null = null;
+	/** The current run was aborted by a stop request (D30), not by a shutdown or a host. */
+	stoppedByRequest = false;
 	private readonly listener = {onChange: () => this.onChange()};
 
 	constructor(private readonly pi: ExtensionAPI) {}
@@ -135,11 +142,12 @@ export class SessionController {
 		if (!file) return; // --no-session: nothing to address
 		this.shipmates = acquire(this.listener);
 		this.file = file;
-		this.shipmates.register({
+		const me = this.shipmates.register({
 			sessionFile: file,
 			sessionId: ctx.sessionManager.getSessionId(),
 			cwd: ctx.cwd,
 		});
+		this.declaredWaiting = me.declaredWaiting;
 		this.bindSpawn(file);
 		this.reconcile();
 		this.reclaimRole(ctx);
@@ -156,6 +164,7 @@ export class SessionController {
 				// pending keeps the gap, so a child that cannot read is retried slowly.
 				if (!this.shipmates.pendingFor(this.file).length)
 					this.shipmates.wakeDone(this.file, 0);
+				this.declareIfCutOff();
 				this.shipmates.unregister(this.file);
 			} catch {}
 			release(this.listener);
@@ -217,6 +226,27 @@ export class SessionController {
 		}
 	}
 
+	/**
+	 * A blocking human_ask cut off before its answer (the session shut down, or a
+	 * host aborted the run) leaves the session waiting for the human, as a
+	 * timeout does (D39), so it is declared, and kept across the reload (D40).
+	 * Not after a stop request: the owner stopped it to redirect it, and its next
+	 * message must wake it. Called from the tool when it sees the abort, and from
+	 * shutdown in case shutdown comes first (a host aborts, then shuts down).
+	 */
+	declareIfCutOff(): void {
+		const w = this.waitingItem;
+		if (!w || w.dialog || this.stoppedByRequest || !this.active) return;
+		if (this.shipmates!.item(w.id)?.state === 'open') this.declareWaiting(true);
+	}
+
+	/** Declare (or clear) waiting-for-human; written through only when it changes. */
+	declareWaiting(on: boolean): void {
+		if (this.declaredWaiting === on) return;
+		this.declaredWaiting = on;
+		if (this.active) this.shipmates!.update(this.file!, {declaredWaiting: on});
+	}
+
 	recordRole(role: string): void {
 		this.pi.appendEntry(ROLE_ENTRY, {role, sessionFile: this.file});
 	}
@@ -242,6 +272,7 @@ export class SessionController {
 		this.ctx = ctx;
 		this.phase = 'running';
 		this.abortedAt = null;
+		this.stoppedByRequest = false;
 		if (this.active) this.runStartedAt = this.shipmates!.now();
 		this.setState('running');
 	}
@@ -443,7 +474,10 @@ export class SessionController {
 		const k = this.shipmates!;
 		for (const req of k.openStops(this.file!)) {
 			const running = this.phase === 'running' && this.runStartedAt <= req.at;
-			if (running) this.ctx!.abort();
+			if (running) {
+				this.stoppedByRequest = true;
+				this.ctx!.abort();
+			}
 			k.settleStop(req.id, running ? 'stopped' : 'not-running');
 		}
 	}
@@ -533,7 +567,7 @@ export class SessionController {
 
 	/** before_agent_start: attach everything held to the run the human (or anyone) just started. */
 	beforeAgentStart(): ReturnType<SessionController['payload']> | undefined {
-		this.declaredWaiting = false;
+		this.declareWaiting(false);
 		const messages = this.take();
 		return messages.length ? this.payload(messages, false) : undefined;
 	}

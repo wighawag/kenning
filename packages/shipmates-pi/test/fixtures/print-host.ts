@@ -14,7 +14,9 @@
 // session's bus (a human's send, D22); without, the send is unmarked (an agent
 // or a schedule). It prints `{"type":"preflight","id","disposition"}` as pi
 // decides what to do with it, and `{"type":"sent","id","error"?}` once the
-// awaited prompt() settles.
+// awaited prompt() settles. `{"type":"reload","id"}` unloads the session
+// (session_shutdown, dispose) and opens its file again, without prompting it,
+// as wherever's pool does with an idle session; it prints `{"type":"reloaded"}`.
 import path from 'node:path';
 import readline from 'node:readline';
 import {
@@ -38,50 +40,68 @@ const cwd = process.cwd();
 const agentDir = process.env.PI_CODING_AGENT_DIR!;
 const sessionDir = process.env.SHIPMATES_TEST_SESSION_DIR!;
 const settingsManager = SettingsManager.inMemory({});
-const resourceLoader = new DefaultResourceLoader({
-	cwd,
-	agentDir,
-	settingsManager,
-	noExtensions: true,
-	noSkills: true,
-	noPromptTemplates: true,
-	noContextFiles: true,
-	additionalExtensionPaths: [SHIPMATES_PI, BRAIN],
-	// The session's own bus, as wherever's human-input marker captures it.
-	extensionFactories: [
-		{
-			name: 'test-human-input',
-			factory: (pi) => {
-				events = pi.events;
+
+// Everything a session needs, built fresh each time, as wherever's pool builds
+// a session it loads (again).
+async function open(sessionManager: SessionManager) {
+	const resourceLoader = new DefaultResourceLoader({
+		cwd,
+		agentDir,
+		settingsManager,
+		noExtensions: true,
+		noSkills: true,
+		noPromptTemplates: true,
+		noContextFiles: true,
+		additionalExtensionPaths: [SHIPMATES_PI, BRAIN],
+		// The session's own bus, as wherever's human-input marker captures it.
+		extensionFactories: [
+			{
+				name: 'test-human-input',
+				factory: (pi) => {
+					events = pi.events;
+				},
 			},
-		},
-	],
-});
-await resourceLoader.reload();
+		],
+	});
+	await resourceLoader.reload();
 
-// The brain registers its provider at load time; nothing flushes it outside a
-// CLI or a bind, so register it the way wherever does (registerExtensionProviders).
-const runtime = await ModelRuntime.create({
-	authPath: path.join(agentDir, 'auth.json'),
-	modelsPath: path.join(agentDir, 'models.json'),
-});
-const models = new ModelRegistry(runtime);
-const ext = resourceLoader.getExtensions().runtime;
-for (const {name, config} of ext.pendingProviderRegistrations)
-	models.registerProvider(name, config);
-ext.pendingProviderRegistrations = [];
+	// The brain registers its provider at load time; nothing flushes it outside a
+	// CLI or a bind, so register it the way wherever does (registerExtensionProviders).
+	const runtime = await ModelRuntime.create({
+		authPath: path.join(agentDir, 'auth.json'),
+		modelsPath: path.join(agentDir, 'models.json'),
+	});
+	const models = new ModelRegistry(runtime);
+	const ext = resourceLoader.getExtensions().runtime;
+	for (const {name, config} of ext.pendingProviderRegistrations)
+		models.registerProvider(name, config);
+	ext.pendingProviderRegistrations = [];
 
-const {session} = await createAgentSession({
-	cwd,
-	agentDir,
-	modelRuntime: runtime,
-	model: models.find('faux', 'brain'),
-	settingsManager,
-	resourceLoader,
-	sessionManager: SessionManager.create(cwd, sessionDir),
-});
-await session.bindExtensions({mode: 'print'});
+	const {session} = await createAgentSession({
+		cwd,
+		agentDir,
+		modelRuntime: runtime,
+		model: models.find('faux', 'brain'),
+		settingsManager,
+		resourceLoader,
+		sessionManager,
+	});
+	await session.bindExtensions({mode: 'print'});
+	return session;
+}
 
+// Teardown as wherever's shutdownAndDisposeAgentSession does it: abort, then
+// session_shutdown to the extensions (dispose() alone does not emit it), then
+// dispose. shipmates unregisters its presence there.
+async function close(s: typeof session) {
+	try {
+		s.agent.abort();
+		await s.extensionRunner.emit({type: 'session_shutdown', reason: 'quit'});
+	} catch {}
+	s.dispose();
+}
+
+let session = await open(SessionManager.create(cwd, sessionDir));
 await session.prompt(process.argv[2] ?? 'hello');
 console.log(
 	JSON.stringify({
@@ -96,6 +116,16 @@ readline.createInterface({input: process.stdin}).on('line', (line) => {
 	try {
 		cmd = JSON.parse(line);
 	} catch {
+		return;
+	}
+	if (cmd.type === 'reload') {
+		// The pool unloads an idle session and loads it again later (D40).
+		const file = session.sessionManager.getSessionFile()!;
+		void (async () => {
+			await close(session);
+			session = await open(SessionManager.open(file, sessionDir));
+			out({type: 'reloaded', id: cmd.id});
+		})();
 		return;
 	}
 	if (cmd.type !== 'send') return;
@@ -118,18 +148,8 @@ readline.createInterface({input: process.stdin}).on('line', (line) => {
 		);
 });
 
-// Teardown as wherever's shutdownAndDisposeAgentSession does it: abort, then
-// session_shutdown to the extensions (dispose() alone does not emit it), then
-// dispose. shipmates unregisters its presence there.
 const stop = async () => {
-	try {
-		session.agent.abort();
-		await session.extensionRunner.emit({
-			type: 'session_shutdown',
-			reason: 'quit',
-		});
-	} catch {}
-	session.dispose();
+	await close(session);
 	process.exit(0);
 };
 process.on('SIGTERM', stop);

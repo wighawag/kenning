@@ -13,6 +13,7 @@ import {
 	type Presence,
 	type Question,
 	type Relay,
+	type SessionSetting,
 	type SessionState,
 } from './types.js';
 import {newId} from './ids.js';
@@ -37,7 +38,14 @@ export interface PresencePatch {
 	waitingOn?: string | null;
 	branch?: string | null;
 	cwd?: string | null;
+	/** Kept per transcript file, across unregister and register (D40). */
 	wake?: boolean;
+	/**
+	 * The session declared `waiting-for-human` (ADR 0006) and has not run since.
+	 * Kept per transcript file like `wake`; `register` restores the state from it
+	 * (D40). It does not set `state`: pass both.
+	 */
+	declaredWaiting?: boolean;
 }
 
 export interface ListFilter {
@@ -56,7 +64,9 @@ type PresenceRow = {
 	status: string | null;
 	refs: string | null;
 	waiting_on: string | null;
-	wake: number;
+	/** From session_setting (D40), not presence's own unused column. */
+	s_wake: number;
+	s_declared_waiting: number;
 	pid: number;
 	start_time: string | null;
 	boot_id: string | null;
@@ -64,6 +74,24 @@ type PresenceRow = {
 	updated_at: number;
 	settled_at: number | null;
 };
+
+type SettingRow = {
+	session_file: string;
+	wake: number;
+	declared_waiting: number;
+	updated_at: number;
+};
+
+const toSetting = (r: SettingRow): SessionSetting => ({
+	sessionFile: r.session_file,
+	wake: r.wake === 1,
+	declaredWaiting: r.declared_waiting === 1,
+	updatedAt: r.updated_at,
+});
+
+/** Presence with the session's own settings (D40); a session with no row has the defaults. */
+const PRESENCE_SELECT = `SELECT p.*, COALESCE(s.wake, 1) AS s_wake, COALESCE(s.declared_waiting, 0) AS s_declared_waiting
+	 FROM presence p LEFT JOIN session_setting s ON s.session_file = p.session_file`;
 
 /** D14: message text is short; content stays in git and messages point at it. */
 const DAY = 86_400_000;
@@ -298,22 +326,32 @@ export class Shipmates {
 		const me = this.probe.self();
 		const t = this.now();
 		this.tx(() => {
+			// A session that declared it waits for the human still does after an
+			// unload or a resume: it has not run since (D40).
+			const declared = this.db
+				.prepare(
+					`SELECT declared_waiting FROM session_setting WHERE session_file = ?`,
+				)
+				.get(input.sessionFile) as {declared_waiting: number} | undefined;
+			const state: SessionState =
+				declared?.declared_waiting === 1 ? 'waiting-for-human' : 'idle';
 			this.db
 				.prepare(
 					`INSERT INTO presence(session_file, session_id, cwd, branch, state, pid, start_time, boot_id, host, registered_at, updated_at)
-					 VALUES(?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?)
+					 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 					 ON CONFLICT(session_file) DO UPDATE SET
 					   session_id = excluded.session_id, cwd = excluded.cwd,
 					   branch = COALESCE(excluded.branch, presence.branch),
 					   pid = excluded.pid, start_time = excluded.start_time, boot_id = excluded.boot_id,
 					   host = excluded.host, updated_at = excluded.updated_at,
-					   state = CASE WHEN presence.pid = excluded.pid THEN presence.state ELSE 'idle' END`,
+					   state = CASE WHEN presence.pid = excluded.pid THEN presence.state ELSE excluded.state END`,
 				)
 				.run(
 					input.sessionFile,
 					input.sessionId ?? null,
 					input.cwd ?? null,
 					input.branch ?? null,
+					state,
 					me.pid,
 					me.startTime,
 					me.bootId,
@@ -342,15 +380,51 @@ export class Shipmates {
 		if (patch.waitingOn !== undefined) put('waiting_on', patch.waitingOn);
 		if (patch.branch !== undefined) put('branch', patch.branch);
 		if (patch.cwd !== undefined) put('cwd', patch.cwd);
-		if (patch.wake !== undefined) put('wake', patch.wake ? 1 : 0);
 		put('updated_at', this.now());
+		const setting =
+			patch.wake !== undefined || patch.declaredWaiting !== undefined;
 		this.tx(() => {
 			this.db
 				.prepare(
 					`UPDATE presence SET ${sets.join(', ')} WHERE session_file = ?`,
 				)
 				.run(...vals, sessionFile);
+			if (setting) this.writeSetting(sessionFile, patch);
 		});
+	}
+
+	/**
+	 * D40: the session's own choices, by transcript file. A row exists only while
+	 * one differs from the default, so the table holds the few sessions that set
+	 * something. Called inside a write.
+	 */
+	private writeSetting(
+		sessionFile: string,
+		patch: {wake?: boolean; declaredWaiting?: boolean},
+	): void {
+		const bit = (v: boolean | undefined) =>
+			v === undefined ? null : v ? 1 : 0;
+		this.db
+			.prepare(
+				`INSERT INTO session_setting(session_file, wake, declared_waiting, updated_at)
+				 VALUES(?, COALESCE(?, 1), COALESCE(?, 0), ?)
+				 ON CONFLICT(session_file) DO UPDATE SET
+				   wake = COALESCE(?, wake), declared_waiting = COALESCE(?, declared_waiting),
+				   updated_at = excluded.updated_at`,
+			)
+			.run(
+				sessionFile,
+				bit(patch.wake),
+				bit(patch.declaredWaiting),
+				this.now(),
+				bit(patch.wake),
+				bit(patch.declaredWaiting),
+			);
+		this.db
+			.prepare(
+				`DELETE FROM session_setting WHERE session_file = ? AND wake = 1 AND declared_waiting = 0`,
+			)
+			.run(sessionFile);
 	}
 
 	unregister(sessionFile: string): void {
@@ -364,9 +438,34 @@ export class Shipmates {
 		});
 	}
 
+	/**
+	 * D40: every session whose own settings differ from the defaults, live or
+	 * not, most recently changed first. A host uses it to show what a session
+	 * that is not loaded chose (wherever's sidebar keeps "waiting for the human"
+	 * for an unloaded session that declared it, which `list()` cannot show).
+	 * Rows exist only for non-defaults, so this is the few that set something.
+	 */
+	settings(): SessionSetting[] {
+		return (
+			this.cached(
+				`SELECT * FROM session_setting ORDER BY updated_at DESC, session_file`,
+			).all() as SettingRow[]
+		).map(toSetting);
+	}
+
+	/** D40: one session's settings; the defaults (`updatedAt` null) when it set none. */
+	setting(sessionFile: string): SessionSetting {
+		const row = this.cached(
+			`SELECT * FROM session_setting WHERE session_file = ?`,
+		).get(sessionFile) as SettingRow | undefined;
+		return row
+			? toSetting(row)
+			: {sessionFile, wake: true, declaredWaiting: false, updatedAt: null};
+	}
+
 	presence(sessionFile: string): Presence | null {
 		const row = this.db
-			.prepare(`SELECT * FROM presence WHERE session_file = ?`)
+			.prepare(`${PRESENCE_SELECT} WHERE p.session_file = ?`)
 			.get(sessionFile) as PresenceRow | undefined;
 		return row ? this.toPresence(row) : null;
 	}
@@ -377,7 +476,7 @@ export class Shipmates {
 
 	list(filter: ListFilter = {}): Presence[] {
 		const rows = this.db
-			.prepare(`SELECT * FROM presence ORDER BY updated_at DESC`)
+			.prepare(`${PRESENCE_SELECT} ORDER BY p.updated_at DESC`)
 			.all() as PresenceRow[];
 		return rows
 			.map((r) => this.toPresence(r))
@@ -1454,21 +1553,32 @@ export class Shipmates {
 	 * arrived after their last stop, and are not archived. One cached query,
 	 * since every session's poller asks on every change. Measured: 3 µs for a
 	 * session that owns nothing, 42 µs with 5 children and one to wake, against
-	 * about 500 µs as separate reads per child. Liveness is left to the caller:
+	 * about 500 µs as separate reads per child; with the settings join (D40),
+	 * 1.2 µs and 17 µs on a later run of the same case. Liveness is left to the caller:
 	 * it is a process probe, not SQL.
+	 *
+	 * The child's own settings apply, as `planDelivery` would apply them were it
+	 * up (D40): never with wake off, and while it declared waiting-for-human only
+	 * for a message of origin `human` (D37). Without that, a child whose
+	 * human_ask timed out was restarted by its owner's next message, which that
+	 * run then delivered before the human answered.
 	 */
 	wakeCandidates(owner: string): Ownership[] {
 		const rows = this.cached(
 			`SELECT o.* FROM ownership o
 			 LEFT JOIN (SELECT session_file, max(at) AS at FROM stop_request GROUP BY session_file) s
 			   ON s.session_file = o.session_file
+			 LEFT JOIN session_setting st ON st.session_file = o.session_file
 			 WHERE o.owner = ? AND o.via = 'headless' AND o.session_file IS NOT NULL
+			   AND COALESCE(st.wake, 1) = 1
 			   AND NOT EXISTS (SELECT 1 FROM archive a WHERE a.session_file = o.session_file)
 			   AND (EXISTS (SELECT 1 FROM message m WHERE m.state = 'pending' AND m.to_kind = 'session'
-			                  AND m.to_target = o.session_file AND m.created_at > COALESCE(s.at, -1))
+			                  AND m.to_target = o.session_file AND m.created_at > COALESCE(s.at, -1)
+			                  AND (COALESCE(st.declared_waiting, 0) = 0 OR m.origin = 'human'))
 			     OR EXISTS (SELECT 1 FROM role r JOIN message m ON m.state = 'pending' AND m.to_kind = 'role'
 			                  AND m.to_target = r.role
-			                WHERE r.session_file = o.session_file AND m.created_at > COALESCE(s.at, -1)))
+			                WHERE r.session_file = o.session_file AND m.created_at > COALESCE(s.at, -1)
+			                  AND (COALESCE(st.declared_waiting, 0) = 0 OR m.origin = 'human')))
 			 ORDER BY o.created_at`,
 		).all(owner) as OwnershipRow[];
 		return rows.map((r) => this.toOwnership(r));
@@ -1641,6 +1751,7 @@ export class Shipmates {
 				)
 				.run(finished);
 			this.pruneOwnership(t);
+			this.pruneSettings(t);
 			for (const row of dead)
 				if (!this.probe.isAlive(this.identityOf(row)))
 					this.db
@@ -1688,6 +1799,22 @@ export class Shipmates {
 					.run(session_file);
 	}
 
+	/**
+	 * D40: a session's settings are kept while its transcript exists, as D25 keeps
+	 * ownership: they go when the file is gone, nobody runs it, and they were last
+	 * changed over 30 days ago. Called inside prune's transaction.
+	 */
+	private pruneSettings(t: number): void {
+		const old = this.db
+			.prepare(`SELECT session_file FROM session_setting WHERE updated_at < ?`)
+			.all(t - 30 * DAY) as {session_file: string}[];
+		for (const {session_file} of old)
+			if (!fs.existsSync(session_file) && !this.isLive(session_file))
+				this.db
+					.prepare(`DELETE FROM session_setting WHERE session_file = ?`)
+					.run(session_file);
+	}
+
 	/** Prune when the last prune is a day old. Cheap enough to call on every open. */
 	pruneIfDue(): boolean {
 		const row = this.db
@@ -1731,7 +1858,8 @@ export class Shipmates {
 			status: r.status,
 			refs: r.refs ? (JSON.parse(r.refs) as string[]) : [],
 			waitingOn: r.waiting_on,
-			wake: r.wake === 1,
+			wake: r.s_wake === 1,
+			declaredWaiting: r.s_declared_waiting === 1,
 			live: this.probe.isAlive(this.identityOf(r)),
 			pid: r.pid,
 			updatedAt: r.updated_at,

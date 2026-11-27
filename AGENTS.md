@@ -2,7 +2,7 @@
 
 ## Read this first
 
-`docs/spec.md` is the specification, and its "Decisions" section (D1 to D38) records every choice with the alternative rejected; `docs/adr/` holds the costly-to-reverse ones. Do not contradict a decision without new evidence; propose a change to the spec instead.
+`docs/spec.md` is the specification, and its "Decisions" section (D1 to D40) records every choice with the alternative rejected; `docs/adr/` holds the costly-to-reverse ones. Do not contradict a decision without new evidence; propose a change to the spec instead.
 
 ## Invariants that must not be broken
 
