@@ -20,6 +20,15 @@ describe('planDelivery', () => {
 		expect(planDelivery(running, {urgent: true})).toBe('at-turn-end');
 	});
 
+	it("a running session gets the human's message at the next turn end, not when its run settles", () => {
+		expect(planDelivery(running, {urgent: false, fromHuman: true})).toBe(
+			'at-turn-end',
+		);
+		expect(planDelivery(running, {urgent: false, fromHuman: false})).toBe(
+			'at-settle',
+		);
+	});
+
 	it('an idle session is woken', () => {
 		expect(planDelivery(settled, {urgent: false})).toBe('wake');
 	});

@@ -30,6 +30,13 @@ export interface SessionView {
  * from the inbox (or a host such as wherever) sat there until the human also
  * typed into the session, which they had no reason to do. Still held while the
  * human types into the session (it joins that run) or with waking off.
+ *
+ * A running session gets the human's message at the next turn end, as if it
+ * were urgent (D41): `human_ask` with `blocking: false` tells the agent to go
+ * on working and that the answer arrives as a message, and at `at-settle` it
+ * arrived only once that work was over. On 2026-11-28 an answer given at 11:23
+ * was still pending an hour later, in one long run, while the session's status
+ * said, truthfully for what it knew, that it was waiting for the human.
  */
 export type DeliveryPlan =
 	'at-settle' | 'at-turn-end' | 'wake' | 'hold-for-human';
@@ -40,7 +47,7 @@ export function planDelivery(
 ): DeliveryPlan {
 	if (view.phase === 'running') {
 		if (view.uiPrompt) return 'at-turn-end';
-		return message.urgent ? 'at-turn-end' : 'at-settle';
+		return message.urgent || message.fromHuman ? 'at-turn-end' : 'at-settle';
 	}
 	if (view.editorBusy || !view.wake) return 'hold-for-human';
 	if (view.declared === 'waiting-for-human' && !message.fromHuman)

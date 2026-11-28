@@ -5,6 +5,7 @@ import {
 	ShipmatesError,
 	type ArchiveMark,
 	type AttentionItem,
+	type ItemStatus,
 	type Message,
 	type Ownership,
 	type SpawnVia,
@@ -15,6 +16,8 @@ import {
 	type Relay,
 	type SessionSetting,
 	type SessionState,
+	type StatusFacts,
+	type StatusRef,
 } from './types.js';
 import {newId} from './ids.js';
 
@@ -204,7 +207,11 @@ type QuestionRow = {
 	answer_relay: string | null;
 	answered_by: string | null;
 	created_at: number;
+	finished_at: number | null;
 };
+
+/** An `h_` or `q_` id as `newId` makes them: the prefix and 8 base64url characters. */
+const REF_ID = /(?<![\w-])([hq])_([A-Za-z0-9_-]{8})(?![\w-])/g;
 
 function toQuestion(r: QuestionRow): Question {
 	return {
@@ -220,6 +227,7 @@ function toQuestion(r: QuestionRow): Question {
 		answerRelay: r.answer_relay ? (JSON.parse(r.answer_relay) as Relay) : null,
 		answeredBy: r.answered_by,
 		createdAt: r.created_at,
+		finishedAt: r.finished_at,
 	};
 }
 
@@ -1147,6 +1155,93 @@ export class Shipmates {
 			)
 			.all(sessionFile) as ItemRow[];
 		return rows.map(toItem);
+	}
+
+	/**
+	 * Where an item's answer stands (D41): the item, and whether the human's
+	 * answer is still pending to the session that raised it.
+	 */
+	itemStatus(id: string): ItemStatus | null {
+		const item = this.item(id);
+		return item ? {...item, answerPending: this.answerPending(item)} : null;
+	}
+
+	/**
+	 * What the human owes this session, and what it has not read yet (D41): the
+	 * items it raised that are open, and the answered ones whose answer is still
+	 * pending to it. Derived, so a reader can trust it over a status line.
+	 */
+	outstandingItems(sessionFile: string): ItemStatus[] {
+		// Both halves use an index (item_open, message_pending): session_list asks
+		// this for every live session.
+		const open = this.cached(
+			`SELECT * FROM item WHERE state = 'open' AND session_file = ?`,
+		).all(sessionFile) as ItemRow[];
+		const unread = this.cached(
+			`SELECT item.* FROM item JOIN message ON message.item_id = item.id
+			 WHERE message.state = 'pending' AND message.to_kind = 'session' AND message.to_target = ?
+			   AND message.kind = 'answer' AND item.session_file = ?`,
+		).all(sessionFile, sessionFile) as ItemRow[];
+		// Disjoint: an open item has no answer yet.
+		return [
+			...open.map((r) => ({...toItem(r), answerPending: false})),
+			...unread.map((r) => ({...toItem(r), answerPending: true})),
+		].sort((a, b) => a.createdAt - b.createdAt);
+	}
+
+	/**
+	 * The derived facts beside a session's status line (D41): its outstanding
+	 * items, and the `h_`/`q_` ids its status names that are no longer open. A
+	 * status is the session's own words: on 2026-11-28 one still said "pending
+	 * human h_..." an hour after the human answered, because the answer had not
+	 * reached it, and a reader told the human they still owed an answer.
+	 */
+	statusFacts(sessionFile: string, status?: string | null): StatusFacts {
+		const text =
+			status === undefined
+				? (this.presence(sessionFile)?.status ?? null)
+				: status;
+		const stale: StatusRef[] = [];
+		const named = new Set<string>();
+		for (const m of text?.matchAll(REF_ID) ?? []) {
+			const id = m[0];
+			if (named.has(id)) continue;
+			named.add(id);
+			const ref =
+				m[1] === 'h' ? this.itemRef(id, sessionFile) : this.questionRef(id);
+			if (ref) stale.push(ref);
+		}
+		return {items: this.outstandingItems(sessionFile), stale};
+	}
+
+	private itemRef(id: string, sessionFile: string): StatusRef | null {
+		const i = this.itemStatus(id);
+		if (!i) return {kind: 'item', id, state: 'unknown'};
+		if (i.state === 'open') return null;
+		return {
+			kind: 'item',
+			id,
+			state: i.state,
+			at: i.finishedAt,
+			channel: i.answerChannel,
+			own: i.session === sessionFile,
+			answerPending: i.answerPending,
+		};
+	}
+
+	private questionRef(id: string): StatusRef | null {
+		const q = this.question(id);
+		if (!q) return {kind: 'question', id, state: 'unknown'};
+		if (q.state === 'open') return null;
+		return {kind: 'question', id, state: q.state, at: q.finishedAt};
+	}
+
+	private answerPending(item: AttentionItem): boolean {
+		if (item.state !== 'answered') return false;
+		return !!this.cached(
+			`SELECT 1 AS x FROM message WHERE state = 'pending' AND to_kind = 'session' AND to_target = ?
+			   AND kind = 'answer' AND item_id = ?`,
+		).get(item.session, item.id);
 	}
 
 	/**

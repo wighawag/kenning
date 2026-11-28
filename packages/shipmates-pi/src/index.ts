@@ -142,7 +142,9 @@ export default function extension(pi: ExtensionAPI): void {
 			}
 			const me = k.presence(ctl.file!);
 			const lines = [
-				me ? formatPresence(me) : ctl.file!,
+				me
+					? formatPresence(me, k.statusFacts(ctl.file!, me.status))
+					: ctl.file!,
 				...formatOwnership(k, ctl.file!),
 				`held messages: ${k.pendingFor(ctl.file!).length}`,
 				`open questions to you: ${k.openQuestionsTo(ctl.file!).length}`,

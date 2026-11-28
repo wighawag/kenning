@@ -1,5 +1,6 @@
 import {Shipmates} from './shipmates.js';
 import {readTail} from './tail.js';
+import {formatStatusFacts} from './facts.js';
 import {ShipmatesError, type AttentionItem, type Presence} from './types.js';
 
 export interface CliIo {
@@ -58,7 +59,8 @@ function speaker(
 	return {kind: 'script'};
 }
 
-function presenceLine(p: Presence): string {
+/** With `k`, the derived lines beside the status (D41): the human reads them too. */
+function presenceLine(p: Presence, k?: Shipmates): string {
 	const bits = [
 		p.roles.join(',') || '(no role)',
 		p.state,
@@ -66,7 +68,10 @@ function presenceLine(p: Presence): string {
 		p.branch,
 		p.status ? `status: ${p.status}` : null,
 	].filter(Boolean);
-	return `${p.sessionFile}\n  ${bits.join(' · ')}`;
+	const facts = k
+		? formatStatusFacts(k.statusFacts(p.sessionFile, p.status))
+		: [];
+	return `${p.sessionFile}\n  ${bits.join(' · ')}${facts.map((l) => `\n  ${l}`).join('')}`;
 }
 
 function itemLine(i: AttentionItem): string {
@@ -110,7 +115,7 @@ export function runCli(argv: string[], io: CliIo): number {
 				else
 					io.stdout(
 						list.length
-							? list.map(presenceLine).join('\n') + '\n'
+							? list.map((p) => presenceLine(p, k)).join('\n') + '\n'
 							: 'No live sessions.\n',
 					);
 				return 0;
@@ -126,7 +131,12 @@ export function runCli(argv: string[], io: CliIo): number {
 				const tail = readTail(r.session);
 				io.stdout(
 					[
-						p ? presenceLine(p) + (p.live ? '' : '  (GONE)') : r.session,
+						p
+							? presenceLine(p, k) + (p.live ? '' : '  (GONE)')
+							: [
+									r.session,
+									...formatStatusFacts(k.statusFacts(r.session, null)),
+								].join('\n  '),
 						qs.length
 							? 'open questions:\n' +
 								qs

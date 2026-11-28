@@ -270,6 +270,39 @@ describe('a running lane', () => {
 		expect(k.presence(fileOf(triggers))!.status).toBe('rebased on 8bb96921');
 		expect(k.pendingFor(fileOf(triggers))).toEqual([]);
 	}, 30_000);
+
+	it("gets the human's answer at the end of the turn it comes in, not when its run settles (D41)", async () => {
+		// 2026-11-28: a non-blocking item answered at 11:23 was still pending an
+		// hour later, because the lane stayed in one run.
+		const from = triggers.mark();
+		triggers.send({
+			type: 'prompt',
+			message:
+				'DO human_ask {"question":"Skip voxlings?","blocking":false}\nDO bash {"command":"sleep 1.5"}',
+		});
+		await triggers.waitFor(
+			(e) => e.type === 'tool_execution_start' && e.toolName === 'bash',
+			{from, what: 'bash to start'},
+		);
+		const item = await eventually(
+			() => k.inbox().find((i) => i.session === fileOf(triggers)),
+			(i) => !!i,
+		);
+		k.answerItem(
+			item!.id,
+			'skip it. DO session_register {"status":"voxlings skipped"}',
+			{channel: 'telegram'},
+		);
+		await settle(triggers, from, 'triggers to finish');
+		const run = triggers.events.slice(from);
+		expect(run.filter((e) => e.type === 'agent_settled')).toHaveLength(1);
+		// At the turn end, the next thing the model did was act on the answer; at
+		// the settle, it would first have closed the run with a text reply.
+		const replies = texts(run).filter((t) => t.startsWith('assistant:'));
+		expect(replies[1]).toBe('assistant: [call session_register]');
+		expect(k.presence(fileOf(triggers))!.status).toBe('voxlings skipped');
+		expect(k.outstandingItems(fileOf(triggers))).toEqual([]);
+	}, 30_000);
 });
 
 describe('the human inbox', () => {
@@ -279,6 +312,13 @@ describe('the human inbox', () => {
 		);
 		const [item] = k.inbox();
 		expect(item.question).toContain('delegated-identity');
+		// Another session sees what the human owes it, whatever its status says (D41).
+		const read = await push.prompt(
+			'DO session_read {"target":"template-tree/messaging","messages":1}',
+		);
+		expect(texts(read).join('\n')).toContain(
+			`its inbox items: ${item.id} open, asked`,
+		);
 		const from = missiv.mark();
 		k.answerItem(item.id, 'done it worked', {channel: 'cli'}); // the human, at their terminal
 		await settle(missiv, from, 'missiv to get the answer');

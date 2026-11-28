@@ -572,10 +572,26 @@ export class SessionController {
 		return messages.length ? this.payload(messages, false) : undefined;
 	}
 
-	/** turn_end: urgent messages, and everything held while a dialog was open. */
+	/**
+	 * turn_end: urgent messages, the human's (D41), and everything held while a
+	 * dialog was open; the planner decides, message by message.
+	 */
 	atTurnEnd(aborted = false): Boundary | undefined {
 		if (aborted) return undefined; // a stopped turn must not be continued (D30)
-		const messages = this.take((m) => m.urgent || this.uiPrompt);
+		const view = {
+			phase: 'running' as const,
+			declared: 'running' as const,
+			uiPrompt: this.uiPrompt,
+			editorBusy: false,
+			wake: true,
+		};
+		const messages = this.take(
+			(m) =>
+				planDelivery(view, {
+					urgent: m.urgent,
+					fromHuman: m.origin === 'human',
+				}) === 'at-turn-end',
+		);
 		if (!messages.length) return undefined;
 		return {
 			entries: [

@@ -23,6 +23,7 @@ export * from './types.js';
 export {readTail} from './tail.js';
 export type {Tail, TailMessage, TailOptions} from './tail.js';
 export {planDelivery} from './delivery.js';
+export {formatItemFact, formatStatusFacts, formatStatusRef} from './facts.js';
 export type {SessionView, DeliveryPlan} from './delivery.js';
 export {watchChanges} from './watch.js';
 export {

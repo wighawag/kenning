@@ -83,6 +83,8 @@ export interface Question {
 	answerRelay: Relay | null;
 	answeredBy: string | null;
 	createdAt: number;
+	/** When it was answered or withdrawn; null while open. */
+	finishedAt: number | null;
 }
 
 /**
@@ -109,6 +111,51 @@ export interface AttentionItem {
 	createdAt: number;
 	/** When it was answered or withdrawn; null while open. */
 	finishedAt: number | null;
+}
+
+/**
+ * An item with where its answer stands for the session that raised it (D41):
+ * `answerPending` while the human's answer is not yet in that session's
+ * transcript. An answered item is not an item the asker knows is answered: a
+ * session in a long run reads it only at a boundary, and its status line can
+ * say "pending" honestly in the meantime (seen on 2026-11-28).
+ */
+export interface ItemStatus extends AttentionItem {
+	answerPending: boolean;
+}
+
+/**
+ * An `h_...` or `q_...` id a status line names, once it is no longer open
+ * (D41): the status is the session's own words and may lag behind it.
+ */
+export type StatusRef =
+	| {
+			kind: 'item';
+			id: string;
+			state: 'answered' | 'withdrawn';
+			at: number | null;
+			channel: string | null;
+			/** Raised by the session whose status names it. */
+			own: boolean;
+			answerPending: boolean;
+	  }
+	| {
+			kind: 'question';
+			id: string;
+			state: 'answered' | 'withdrawn';
+			at: number | null;
+	  }
+	| {kind: 'item' | 'question'; id: string; state: 'unknown'};
+
+/**
+ * What shipmates knows about a session that its status line may not say (D41),
+ * derived from the store rather than declared.
+ */
+export interface StatusFacts {
+	/** Items it raised that are open, or answered with the answer still pending to it; oldest first. */
+	items: ItemStatus[];
+	/** Ids its status names that are no longer open, in the order named. */
+	stale: StatusRef[];
 }
 
 /** How a session came to be owned (D23): through a host, or the terminal default (D19). */

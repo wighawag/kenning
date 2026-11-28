@@ -1,9 +1,11 @@
+import {formatStatusFacts} from 'shipmates';
 import type {
 	AttentionItem,
 	Shipmates,
 	Message,
 	Presence,
 	Question,
+	StatusFacts,
 	Tail,
 } from 'shipmates';
 
@@ -66,7 +68,12 @@ export function formatDelivery(
 	return lines.join('\n');
 }
 
-export function formatPresence(p: Presence): string {
+/**
+ * A session's presence; with `facts` (D41), the derived lines that a reader
+ * should trust over the status text: its inbox items, and the ids its status
+ * names that are no longer open.
+ */
+export function formatPresence(p: Presence, facts?: StatusFacts): string {
 	const bits = [
 		p.roles.length ? p.roles.join(',') : '(no role)',
 		p.state,
@@ -77,7 +84,8 @@ export function formatPresence(p: Presence): string {
 		p.waitingOn ? `waiting on ${p.waitingOn}` : null,
 		p.live ? null : 'GONE',
 	].filter(Boolean);
-	return `${p.sessionFile}\n  ${bits.join(' · ')}`;
+	const extra = facts ? formatStatusFacts(facts).map((l) => `\n  ${l}`) : [];
+	return `${p.sessionFile}\n  ${bits.join(' · ')}${extra.join('')}`;
 }
 
 /** A session's owner and the sessions it owns (D23), as lines for status output. */
